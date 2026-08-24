@@ -515,6 +515,9 @@ class TrainConfig:
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
+    # Wandb entity (team/username) to log runs under. If None, uses the default entity
+    # associated with your wandb login/API key.
+    wandb_entity: str | None = None
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None

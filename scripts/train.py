@@ -82,7 +82,7 @@ def init_wandb(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
-            entity="daiyp_umich",
+            entity=config.wandb_entity,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
