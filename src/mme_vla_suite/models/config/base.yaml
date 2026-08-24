@@ -27,7 +27,7 @@ memory_token_dim: 2048 # context: 2048; modulation: 1024; expert: 1024
 # memory representation
 representation_type: perceptual # [perceptual, recurrent, symbolic]
 perceptual_memory:
-  type: frame_sampling # [frame_sampling, token_dropping]
+  type: frame_sampling # [frame_sampling, token_dropping, random_sampling]
 
 recurrent_memory:
   type: ttt # [ttt, rmt]

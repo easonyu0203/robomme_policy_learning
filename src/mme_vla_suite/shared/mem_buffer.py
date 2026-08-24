@@ -320,6 +320,23 @@ class MemoryBuffer:
         return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image)
 
 
+    def get_random_sampling_indices(self, step_idx, token_budget, token_per_image, rng=None):
+        # random_sampling: identical "N frames x token_per_image" packing as frame_sampling,
+        # just with a uniformly random subset of history frames instead of an evenly-spaced one.
+        rng = rng if rng is not None else np.random
+        max_size = token_budget // (token_per_image * self.num_views)
+        n_available = step_idx + 1  # causal: frames 0..step_idx are all we're allowed to see
+        size = min(max_size, n_available)
+        return sorted(int(i) for i in rng.choice(n_available, size=size, replace=False))
+
+
+    def prepare_random_sampling(self, step_idx, token_budget, token_per_image, history_feats_gather_fn, rng=None, *args, **kwargs):
+        indices_to_load = self.get_random_sampling_indices(step_idx, token_budget, token_per_image, rng=rng)
+        history_feats = history_feats_gather_fn(indices_to_load, *args, **kwargs)
+        # packing/padding only depends on *which* indices were chosen, not how -- reuse it as-is.
+        return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image)
+
+
     def _visualize_frame_sampling(self, indices_to_load, step_idx):
         images = [self._history_feats[idx]["image_pixels"][0] for idx in indices_to_load]
         

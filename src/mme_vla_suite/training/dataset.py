@@ -134,12 +134,21 @@ class RoboMMEDataset(Dataset):
         token_budget = self.history_config.budget
 
         return self.mem_buffer.prepare_frame_sampling(
-            step_idx, token_budget, token_per_image, self._gather_history_feat, 
+            step_idx, token_budget, token_per_image, self._gather_history_feat,
             epis_idx=epis_idx)
 
 
-    
-    def prepare_token_recurrent(self, epis_idx, step_idx, exec_start_idx):      
+    def prepare_random_sampling(self, epis_idx, step_idx):
+        token_per_image = self.history_config.token_per_image
+        token_budget = self.history_config.budget
+
+        return self.mem_buffer.prepare_random_sampling(
+            step_idx, token_budget, token_per_image, self._gather_history_feat,
+            epis_idx=epis_idx)
+
+
+
+    def prepare_token_recurrent(self, epis_idx, step_idx, exec_start_idx):
         self.mem_buffer.exec_start_idx = exec_start_idx
         
         return self.mem_buffer.prepare_token_recurrent(
@@ -223,13 +232,24 @@ class RoboMMEDataset(Dataset):
                         static_state_emb,
                         static_mask, # >=64
                     ) = self.prepare_token_drop(epis_idx, step_idx)
-                else:
+                elif self.history_config.perceptual_memory.type == "random_sampling":
+                    (
+                        static_img_emb,
+                        static_pos_emb,
+                        static_state_emb,
+                        static_mask,
+                    ) = self.prepare_random_sampling(epis_idx, step_idx)
+                elif self.history_config.perceptual_memory.type == "frame_sampling":
                     (
                         static_img_emb,
                         static_pos_emb,
                         static_state_emb,
                         static_mask, # slow >=64, mid >=16,fast >=4
                     ) = self.prepare_frame_sampling(epis_idx, step_idx)
+                else:
+                    raise ValueError(
+                        f"Unknown perceptual_memory.type: {self.history_config.perceptual_memory.type}"
+                    )
                 
                 data["static_image_emb"] = static_img_emb
                 data["static_pos_emb"] = static_pos_emb
