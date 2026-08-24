@@ -1,6 +1,10 @@
 """
 We implemented our own data loader,
 which can be 5-10x faster than LeRobot dataloader and can avoid memory explosion issue
+
+--
+Update: We improve our dataloader by using np.memmap to load history features from per-episode .bin files.
+see dataset_mmap.py for details.
 """
 
 import jax
@@ -11,8 +15,17 @@ from openpi.training.data_loader import DataLoader, TorchDataLoader,transform_da
 import openpi.training.config as _config
 
 from mme_vla_suite.training.dataset import RoboMMEDataset
+from mme_vla_suite.training.dataset_bin import RoboMMEDatasetBin
+from mme_vla_suite.training.dataset_mmap import RoboMMEDatasetMmap
 from mme_vla_suite.models.integration.history_observation import HistAugObservation
 from mme_vla_suite.models.config.utils import get_history_config
+
+
+DATASET_CLASSES = {
+    "npy": RoboMMEDataset,
+    "bin": RoboMMEDatasetBin,
+    "mmap": RoboMMEDatasetMmap,
+}
 
 
 
@@ -43,16 +56,31 @@ def create_data_loader(
     num_batches: int | None = None,
     num_workers: int = 0,
     seed: int = 0,
+    dataset_type: str = "npy",
+    num_read_threads: int = 1,
 ) -> DataLoader[tuple[HistAugObservation, _model.Actions]]:
-    
+
     history_config = get_history_config(history_config)
 
-    dataset = RoboMMEDataset(
+    if dataset_type not in DATASET_CLASSES:
+        raise ValueError(
+            f"Unknown dataset_type '{dataset_type}', must be one of {list(DATASET_CLASSES)}"
+        )
+    dataset_cls = DATASET_CLASSES[dataset_type]
+    logging.info(f"Using dataset class: {dataset_cls.__name__} (dataset_type='{dataset_type}')")
+
+    dataset_kwargs = dict(
         dataset_path=dataset_path,
-        data_config=data_config, 
-        history_config=history_config, 
-        action_horizon=action_horizon
+        data_config=data_config,
+        history_config=history_config,
+        action_horizon=action_horizon,
     )
+    # Only the bin loader supports multi-threaded reads (mmap uses the kernel
+    # page cache, npy uses its own ThreadPoolExecutor already).
+    if dataset_type == "bin":
+        dataset_kwargs["num_read_threads"] = num_read_threads
+
+    dataset = dataset_cls(**dataset_kwargs)
     
     dataset = transform_dataset(
         dataset, data_config, skip_norm_stats=skip_norm_stats)
