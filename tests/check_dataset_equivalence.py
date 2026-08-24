@@ -50,8 +50,6 @@ def _compare_samples(s_ref, s_other, label_other, idx, config_label):
     errors = []
     ref_keys = {k for k, v in s_ref.items() if v is not None and k not in SKIP_KEYS}
     other_keys = {k for k, v in s_other.items() if v is not None and k not in SKIP_KEYS}
-    
-    import pdb; pdb.set_trace()
 
     if ref_keys != other_keys:
         extra = other_keys - ref_keys
