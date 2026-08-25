@@ -4,6 +4,13 @@ import jax.numpy as jnp
 
 import openpi.shared.array_typing as at
 from mme_vla_suite.models.representation.mem_encoder import FeatureEncoder
+from mme_vla_suite.models.representation.selector import (
+    Selector,
+    batch_gather,
+    gumbel_softmax_hard,
+    select_topk,
+    selector_losses,
+)
 
 
 class PerceptualMemory(nnx.Module):
@@ -27,11 +34,29 @@ class PerceptualMemory(nnx.Module):
             use_state_emb=self.config.use_state_emb,
         )
 
+        selector_cfg = config.perceptual_memory.get("selector", None)
+        self.use_selector = selector_cfg is not None and selector_cfg.get("enabled", False)
+        if self.use_selector:
+            self.selector = Selector(
+                dim=config.memory_token_dim,
+                depth=selector_cfg.get("depth", 2),
+                num_heads=selector_cfg.get("num_heads", 8),
+                num_register_tokens=selector_cfg.get("num_register_tokens", 4),
+                rngs=rngs,
+                dtype=dtype,
+            )
+            self.keep_ratio = selector_cfg.get("keep_ratio", 0.5)
+            self.num_keep = round(config.budget * self.keep_ratio)
+
     def __call__(
         self,
         static_image_emb: at.Float[at.Array, "b l d1"],
         static_pos_emb: at.Float[at.Array, "b l d2"],
         static_state_emb: at.Float[at.Array, "b l d3"],
+        static_mask: at.Bool[at.Array, "b l"] | None = None,
+        *,
+        train: bool = False,
+        rng: at.KeyArrayLike | None = None,
     ):
         # get memory tokens using feature encoder
         assert static_image_emb.shape[1] == self.config.budget
@@ -40,4 +65,32 @@ class PerceptualMemory(nnx.Module):
             static_image_emb, static_pos_emb, static_state_emb
         )
 
-        return hidden_states, None, None
+        if not self.use_selector:
+            return hidden_states, None, None
+
+        valid_mask = (
+            static_mask
+            if static_mask is not None
+            else jnp.ones(hidden_states.shape[:2], dtype=jnp.bool_)
+        )
+        logits = self.selector(hidden_states, valid_mask)
+
+        if train:
+            assert rng is not None, "train=True requires `rng` for Gumbel-softmax sampling"
+            decision = gumbel_softmax_hard(logits, rng)[..., 0]
+            # Continuous, gradient-carrying (via the straight-through decision)
+            # keep-weight. Sequence length stays at `budget` -- see
+            # MemoryAttention's masked-softmax for why this is differentiable
+            # all the way back to the selector's logits.
+            mem_weight = decision * valid_mask.astype(hidden_states.dtype)
+            losses = selector_losses(logits, decision, valid_mask, self.keep_ratio)
+            return hidden_states, mem_weight, losses
+
+        # Eval: deterministic top-k by keep margin, physically gathered --
+        # the only place the sequence actually shortens (the real
+        # inference-time compute saving).
+        topk_idx = select_topk(logits, valid_mask, self.num_keep)
+        gathered_states = batch_gather(hidden_states, topk_idx)
+        gathered_mask = batch_gather(valid_mask, topk_idx).astype(hidden_states.dtype)
+        stats = {"keep_frac": jnp.asarray(self.num_keep / self.config.budget, dtype=hidden_states.dtype)}
+        return gathered_states, gathered_mask, stats

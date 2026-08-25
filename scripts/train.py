@@ -282,6 +282,14 @@ def train_step(
     if config.model.use_history and hasattr(grads, "mem_encoder"):
         info["mem_enc_norm"] = optax.global_norm(grads.mem_encoder)
 
+    # Selector stats (ratio_loss/z_loss/load_balance_loss/keep_frac) are a
+    # flat scalar dict, unlike recurrent memory's per-step dict (which has a
+    # "mask" key and is handled separately by get_stats below) -- merge them
+    # into `info` so the existing stack/mean/wandb.log machinery picks them
+    # up automatically, same as every other `info` key.
+    if isinstance(stats, dict) and "mask" not in stats:
+        info.update(stats)
+
     return new_state, info, stats
 
 

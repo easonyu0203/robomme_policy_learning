@@ -261,6 +261,12 @@ class HistoryPi0(BaseModel):
                     rngs=rngs,
                     dtype=config.dtype,
                 )
+                selector_cfg = self.history_config.perceptual_memory.get("selector", None)
+                if selector_cfg is not None and selector_cfg.get("enabled", False):
+                    assert self.integration_type == "modulation", (
+                        "perceptual_memory.selector is currently only supported with "
+                        "integration_type='modulation'"
+                    )
             elif self.representation_type == "recurrent":
                 from mme_vla_suite.models.representation.recur_mem import (
                     RecurrentMemory,
@@ -392,12 +398,27 @@ class HistoryPi0(BaseModel):
         self.deterministic = True
 
     @at.typecheck
-    def embed_memory(self, obs: HistAugObservation):
+    def embed_memory(
+        self, obs: HistAugObservation, *, train: bool = False, rng: at.KeyArrayLike | None = None
+    ):
         if self.representation_type == "perceptual":
-            tokens, _, stats = self.mem_encoder(
-                obs.static_image_emb, obs.static_pos_emb, obs.static_state_emb
+            tokens, mem_mask, stats = self.mem_encoder(
+                obs.static_image_emb,
+                obs.static_pos_emb,
+                obs.static_state_emb,
+                obs.static_mask,
+                train=train,
+                rng=rng,
             )
-            input_mask = obs.static_mask
+            # `mem_mask` is None (selector disabled -- every mode but the new
+            # hard-selection one) or a continuous [0,1] keep-weight (selector
+            # enabled); only the latter needs float32 downstream (see
+            # MemoryAttention's masked-softmax). Left as whatever dtype it
+            # already is here -- forced to float only at the modulation
+            # call site in compute_loss/sample_actions, since this method is
+            # also shared by context/expert, which need a boolean mask for
+            # make_attn_mask.
+            input_mask = mem_mask if mem_mask is not None else obs.static_mask
             ar_mask = [False] * tokens.shape[1]
             na_mask = [False] * tokens.shape[1]
         elif self.representation_type == "recurrent":
@@ -562,7 +583,7 @@ class HistoryPi0(BaseModel):
         *,
         train: bool = False,
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, noise_rng, time_rng, selector_rng = jax.random.split(rng, 4)
         observation = preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
@@ -614,7 +635,10 @@ class HistoryPi0(BaseModel):
                 adarms_cond=[None, None, adarms_cond],
             )
         elif self.integration_type == "modulation":
-            mem_seq, mem_mask, _, _, stats = self.embed_memory(observation)
+            mem_seq, mem_mask, _, _, stats = self.embed_memory(
+                observation, train=train, rng=selector_rng
+            )
+            mem_mask = mem_mask.astype(jnp.float32) if mem_mask is not None else None
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
@@ -632,10 +656,17 @@ class HistoryPi0(BaseModel):
             )
 
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-        
-        # import pdb; pdb.set_trace()
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1), stats
+        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if isinstance(stats, dict) and "ratio_loss" in stats:
+            selector_cfg = self.history_config.perceptual_memory.selector
+            aux_loss = (
+                selector_cfg.get("ratio_loss_weight", 0.0) * stats["ratio_loss"]
+                + selector_cfg.get("z_loss_weight", 0.0) * stats["z_loss"]
+                + selector_cfg.get("load_balance_loss_weight", 0.0) * stats["load_balance_loss"]
+            )
+            action_loss = action_loss + aux_loss
+        return action_loss, stats
 
     @override
     def sample_actions(
@@ -682,7 +713,8 @@ class HistoryPi0(BaseModel):
             _, kv_cache = self.PaliGemma.llm(
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
             )
-            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
+            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation, train=False)
+            mem_mask = mem_mask.astype(jnp.float32) if mem_mask is not None else None
             
         else:
             prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)

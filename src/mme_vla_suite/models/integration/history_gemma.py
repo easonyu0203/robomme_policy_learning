@@ -94,9 +94,20 @@ class MemoryAttention(nn.Module):
         logits = jnp.einsum(
             "BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32
         )
-        attn_mask = mem_mask[:, None, None, None, :]  # (B, 1, 1, 1, S)
-        masked_logits = jnp.where(attn_mask, logits, -2.3819763e38)
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(x.dtype)
+        # `mem_mask` is a continuous [0,1] keep-weight, not necessarily a hard
+        # boolean -- the hard-selection selector (percep_mem.py) passes a
+        # straight-through {0,1} decision that must stay differentiable, and
+        # jnp.where's condition carries no gradient, so masking can't go
+        # through it. Fold the weight into the attention weights *after*
+        # exp() instead, renormalizing over only the kept mass. For a
+        # pure-{0,1} mask (every mode except hard-selection) this is
+        # numerically identical to the old jnp.where formulation, up to the
+        # eps guard below (unreachable in practice: at least one memory slot
+        # is always real, so the denominator is never near-zero).
+        mem_weight = mem_mask[:, None, None, None, :].astype(jnp.float32)  # (B, 1, 1, 1, S)
+        logits_stable = logits - jax.lax.stop_gradient(logits.max(axis=-1, keepdims=True))
+        exp_scores = jnp.exp(logits_stable) * mem_weight
+        probs = (exp_scores / (exp_scores.sum(axis=-1, keepdims=True) + 1e-6)).astype(x.dtype)
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -277,7 +288,7 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
-        mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
+        mem_mask: Sequence[at.Float[at.Array, "b lmem"] | None] | None = None,
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
@@ -320,5 +331,5 @@ class Module(nn.Module):
                 jnp.zeros((1, 4, c.width)) if m else None
                 for c, m in zip(self.configs, mem_mods, strict=True)
             ],
-            mem_mask=[jnp.ones((1, 4), dtype=bool) if m else None for m in mem_mods],
+            mem_mask=[jnp.ones((1, 4), dtype=jnp.float32) if m else None for m in mem_mods],
         )
