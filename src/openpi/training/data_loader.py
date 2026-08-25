@@ -8,6 +8,7 @@ import time
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import torch
 
@@ -466,16 +467,76 @@ class TorchDataLoader:
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                    yield jax.tree.map(
+                        lambda x: jax.make_array_from_process_local_data(self._sharding, _leaf_to_numpy(x)), batch
+                    )
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                    yield jax.tree.map(_leaf_to_torch, batch)
+
+
+class _Bfloat16AsUint16:
+    """A bfloat16 array, carried across the DataLoader worker->main IPC boundary
+    as a bit-identical uint16 torch.Tensor.
+
+    `_collate_fn` returns torch.Tensor leaves (instead of numpy arrays) so that
+    PyTorch's DataLoader worker->main handoff uses its shared-memory tensor
+    reducer instead of pickling raw array bytes through a multiprocessing
+    pipe -- for the large history-embedding batches this project moves
+    (hundreds of MB/batch), the plain-pickle path measurably serializes at
+    ~1 GB/s, which is enough alone to stall the GPU waiting on data. See
+    tests/speed_testing.py for throughput comparisons.
+
+    torch has no bfloat16<->numpy bridge (`torch.from_numpy` rejects
+    `ml_dtypes.bfloat16` arrays outright), so bf16 leaves (the image
+    embeddings) are bitcast to uint16 for the trip and reinterpreted back
+    (also a bitcast, not a value conversion) at the one point each framework
+    actually consumes the array. This class is intentionally NOT registered
+    as a JAX pytree node, so `jax.tree.map` treats it as an opaque leaf and
+    carries it through unmolested.
+    """
+
+    __slots__ = ("tensor",)
+
+    def __init__(self, tensor: torch.Tensor):
+        self.tensor = tensor
+
+
+def _leaf_to_numpy(x):
+    if isinstance(x, _Bfloat16AsUint16):
+        return x.tensor.numpy().view(ml_dtypes.bfloat16)
+    if isinstance(x, torch.Tensor):
+        return x.numpy()
+    return x  # a dtype torch couldn't bridge (see _collate_fn) -- already numpy.
+
+
+def _leaf_to_torch(x):
+    if isinstance(x, _Bfloat16AsUint16):
+        return x.tensor.view(torch.bfloat16)
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(x)  # a dtype torch couldn't bridge in the worker; try once more here.
 
 
 def _collate_fn(items):
-    """Collate the batch elements into batched numpy arrays."""
+    """Collate the batch elements into batched torch tensors (see
+    `_Bfloat16AsUint16` for why torch tensors rather than numpy arrays).
+    """
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    def _stack(*xs):
+        arr = np.stack([np.asarray(x) for x in xs], axis=0)
+        if arr.dtype == ml_dtypes.bfloat16:
+            return _Bfloat16AsUint16(torch.from_numpy(arr.view(np.uint16)))
+        try:
+            return torch.from_numpy(arr)
+        except TypeError:
+            # torch has no bridge for this dtype (e.g. an object/string array
+            # from a field a caller didn't strip before collation). Fall back
+            # to the plain numpy array -- same as this function's behavior
+            # before it started returning torch tensors for the fast-IPC path.
+            return arr
+
+    return jax.tree.map(_stack, *items)
 
 
 def _worker_init_fn(worker_id: int) -> None:
