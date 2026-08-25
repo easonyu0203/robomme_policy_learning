@@ -34,7 +34,7 @@ def determine_mode(zip_path: Path) -> str:
     return "flat"
 
 
-def unzip_one(zip_path: Path, overwrite: bool = False) -> None:
+def unzip_one(zip_path: Path, overwrite: bool = False, delete_after: bool = False) -> None:
     zip_path = zip_path.resolve()
     mode = determine_mode(zip_path)
 
@@ -52,6 +52,8 @@ def unzip_one(zip_path: Path, overwrite: bool = False) -> None:
         # For "flat" mode we can't easily decide if we're "done", so we always
         # extract unless the user explicitly skips it by not running the script.
         print(f"[skip] {zip_path} -> {out_dir} (already exists)")
+        if delete_after:
+            zip_path.unlink(missing_ok=True)
         return
 
     try:
@@ -91,6 +93,8 @@ def unzip_one(zip_path: Path, overwrite: bool = False) -> None:
                     dst.write(src.read())
 
         print(f"[ok]   {zip_path} -> {out_dir} (mode={mode})")
+        if delete_after:
+            zip_path.unlink(missing_ok=True)
     except BadZipFile:
         print(f"[bad]  {zip_path} is not a valid zip file")
     except Exception as e:
@@ -103,7 +107,8 @@ def find_zip_files(root: Path):
 
 def _worker(args):
     """Helper for multiprocessing.imap_unordered."""
-    return unzip_one(*args)
+    zip_path, overwrite, delete_after = args
+    return unzip_one(zip_path, overwrite=overwrite, delete_after=delete_after)
 
 
 def main():
@@ -137,6 +142,15 @@ def main():
             "Flat mode always writes/overwrites files in-place."
         ),
     )
+    parser.add_argument(
+        "--delete-after",
+        action="store_true",
+        help=(
+            "Delete each .zip once it's confirmed extracted (or was already "
+            "extracted in a prior run), to save disk. A zip is left in place "
+            "if extraction fails (bad zip / error)."
+        ),
+    )
     args = parser.parse_args()
 
     root = Path(args.root).resolve()
@@ -153,7 +167,7 @@ def main():
     procs = args.processes or mp.cpu_count()
 
     # Prepare argument tuples for workers
-    tasks = [(zp, args.overwrite) for zp in zips]
+    tasks = [(zp, args.overwrite, args.delete_after) for zp in zips]
 
     with mp.Pool(processes=procs) as pool:
         for _ in tqdm(
