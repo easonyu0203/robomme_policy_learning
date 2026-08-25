@@ -443,7 +443,13 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
                     stats_dict = get_stats(stats)
                     pbar.write(f"Recurrent Memory Stats: {stats_dict}")
 
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            # float(v), not v directly: some logged stats (e.g. the hard-select
+            # perceptual_memory.selector's ratio/z/load-balance losses) are
+            # bfloat16 -- ml_dtypes.bfloat16.__format__ stringifies before
+            # applying the format spec, so `f"{v:.4f}"` on one raises
+            # "ValueError: Unknown format code 'f' for object of type 'str'".
+            # float() goes through __float__ instead, which works for any dtype.
+            info_str = ", ".join(f"{k}={float(v):.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
