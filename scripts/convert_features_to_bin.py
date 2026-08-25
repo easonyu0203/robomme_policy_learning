@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -108,37 +109,79 @@ def convert_episode(epis_dir, output_dir):
     return epis_name, T, V, state_dim
 
 
+def episode_already_converted(epis_name, output_dir):
+    for r in RESOLUTIONS:
+        if not os.path.exists(os.path.join(output_dir, f"image_emb_{r}", f"{epis_name}.bin")):
+            return False
+        if not os.path.exists(os.path.join(output_dir, f"pos_emb_{r}", f"{epis_name}.bin")):
+            return False
+    return os.path.exists(os.path.join(output_dir, "state", f"{epis_name}.bin"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert .npy features to .bin format")
     parser.add_argument("--features_dir", type=str, required=True,
                         help="Input features/ directory with episode_* subdirs")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for .bin files (e.g. features_bin/)")
+    parser.add_argument("--num_workers", type=int, default=1,
+                        help="Number of episodes to convert in parallel (each episode is independent)")
     args = parser.parse_args()
 
     for subdir in SUBDIRS:
         os.makedirs(os.path.join(args.output_dir, subdir), exist_ok=True)
 
     # Find episode directories
-    epis_dirs = sorted(
+    all_epis_dirs = sorted(
         [os.path.join(args.features_dir, d)
          for d in os.listdir(args.features_dir)
          if d.startswith("episode_") and os.path.isdir(os.path.join(args.features_dir, d))],
         key=lambda x: int(os.path.basename(x).split("_")[1]),
     )
-    print(f"Found {len(epis_dirs)} episodes in {args.features_dir}")
+    print(f"Found {len(all_epis_dirs)} episodes in {args.features_dir}")
 
+    metadata_path = os.path.join(args.output_dir, "metadata.json")
     metadata = {}
-    for i, epis_dir in enumerate(epis_dirs):
-        result = convert_episode(epis_dir, args.output_dir)
-        if result is None:
-            continue
-        name, T, V, state_dim = result
-        metadata[name] = {"frames": T, "num_views": V, "state_dim": state_dim}
-        if (i + 1) % 50 == 0 or i == len(epis_dirs) - 1:
-            print(f"[{i + 1}/{len(epis_dirs)}] {name}: {T} frames")
+    if os.path.exists(metadata_path):
+        with open(metadata_path) as f:
+            metadata = json.load(f)
 
-    with open(os.path.join(args.output_dir, "metadata.json"), "w") as f:
+    epis_dirs = [
+        d for d in all_epis_dirs
+        if not episode_already_converted(os.path.basename(d), args.output_dir)
+    ]
+    skipped = len(all_epis_dirs) - len(epis_dirs)
+    if skipped:
+        print(f"Skipping {skipped} already-converted episodes, converting {len(epis_dirs)} remaining")
+
+    done = skipped
+    if args.num_workers <= 1:
+        for epis_dir in epis_dirs:
+            result = convert_episode(epis_dir, args.output_dir)
+            done += 1
+            if result is None:
+                continue
+            name, T, V, state_dim = result
+            metadata[name] = {"frames": T, "num_views": V, "state_dim": state_dim}
+            if done % 50 == 0 or done == len(all_epis_dirs):
+                print(f"[{done}/{len(all_epis_dirs)}] {name}: {T} frames")
+    else:
+        with ProcessPoolExecutor(max_workers=args.num_workers) as pool:
+            futures = {
+                pool.submit(convert_episode, epis_dir, args.output_dir): epis_dir
+                for epis_dir in epis_dirs
+            }
+            for fut in as_completed(futures):
+                result = fut.result()
+                done += 1
+                if result is None:
+                    continue
+                name, T, V, state_dim = result
+                metadata[name] = {"frames": T, "num_views": V, "state_dim": state_dim}
+                if done % 50 == 0 or done == len(all_epis_dirs):
+                    print(f"[{done}/{len(all_epis_dirs)}] {name}: {T} frames")
+
+    with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
     print(f"\nDone! Converted {len(metadata)} episodes to {args.output_dir}")
