@@ -49,7 +49,7 @@ SUBDIRS = (
 )
 
 
-def convert_episode(epis_dir, output_dir):
+def convert_episode(epis_dir, output_dir, delete_source=False):
     epis_name = os.path.basename(epis_dir)
 
     # Collect .npy files sorted by step index
@@ -106,6 +106,9 @@ def convert_episode(epis_dir, output_dir):
             os.path.join(output_dir, "kept_indices", f"{epis_name}.json"),
         )
 
+    if delete_source:
+        shutil.rmtree(epis_dir, ignore_errors=True)
+
     return epis_name, T, V, state_dim
 
 
@@ -124,8 +127,11 @@ def main():
                         help="Input features/ directory with episode_* subdirs")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for .bin files (e.g. features_bin/)")
-    parser.add_argument("--num_workers", type=int, default=1,
+    parser.add_argument("--num_workers", type=int, default=max(1, os.cpu_count() or 1),
                         help="Number of episodes to convert in parallel (each episode is independent)")
+    parser.add_argument("--delete_source", action="store_true",
+                        help="Delete each episode's raw .npy features once it's converted, to save disk "
+                             "(the .bin output is a full replacement -- training reads only that).")
     args = parser.parse_args()
 
     for subdir in SUBDIRS:
@@ -157,7 +163,7 @@ def main():
     done = skipped
     if args.num_workers <= 1:
         for epis_dir in epis_dirs:
-            result = convert_episode(epis_dir, args.output_dir)
+            result = convert_episode(epis_dir, args.output_dir, args.delete_source)
             done += 1
             if result is None:
                 continue
@@ -168,7 +174,7 @@ def main():
     else:
         with ProcessPoolExecutor(max_workers=args.num_workers) as pool:
             futures = {
-                pool.submit(convert_episode, epis_dir, args.output_dir): epis_dir
+                pool.submit(convert_episode, epis_dir, args.output_dir, args.delete_source): epis_dir
                 for epis_dir in epis_dirs
             }
             for fut in as_completed(futures):
