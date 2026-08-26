@@ -20,21 +20,27 @@ class PerceptualMemory(nnx.Module):
 
         self.mem_type = config.perceptual_memory.type
 
+        # Defensive, like selector_cfg below: configs predating use_time_emb/
+        # memory_feature.time entirely (e.g. a frozen pre-d182ebe checkpoint's
+        # history_config snapshot) must still load, not KeyError.
+        use_time_emb = config.get("use_time_emb", False)
+        time_feature_cfg = config.memory_feature.get("time", None) if use_time_emb else None
+
         self.feature_encoder = FeatureEncoder(
             rngs=rngs,
             dtype=dtype,
             image_input_dim=self.config.memory_feature.img.input_dim,
             pos_input_dim=self.config.memory_feature.pos.input_dim,
             state_input_dim=self.config.memory_feature.state.input_dim,
-            time_input_dim=self.config.memory_feature.time.input_dim,
+            time_input_dim=time_feature_cfg.input_dim if time_feature_cfg is not None else 1,
             pos_output_dim=self.config.memory_feature.pos.hidden_dim,
             state_output_dim=self.config.memory_feature.state.hidden_dim,
-            time_output_dim=self.config.memory_feature.time.hidden_dim,
+            time_output_dim=time_feature_cfg.hidden_dim if time_feature_cfg is not None else 64,
             ouput_dim_for_recur=None,
             output_dim_for_percep=self.config.memory_token_dim,
             use_pos_emb=self.config.use_pos_emb,
             use_state_emb=self.config.use_state_emb,
-            use_time_emb=self.config.use_time_emb,
+            use_time_emb=use_time_emb,
         )
 
         selector_cfg = config.perceptual_memory.get("selector", None)
