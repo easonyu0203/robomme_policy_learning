@@ -144,25 +144,26 @@ class MME_VLA_Policy:
             token_budget = self.config.budget
             
             if self.config.perceptual_memory.type == "token_dropping":
-                static_image_emb, static_pos_emb, static_state_emb, static_mask = \
+                static_image_emb, static_pos_emb, static_state_emb, static_time_emb, static_mask = \
                     self.mem_buffer.prepare_token_dropping(
                         self.step_idx, token_budget, history_feats_gather_fn)
             elif self.config.perceptual_memory.type == "random_sampling":
                 token_per_image = self.config.token_per_image
-                static_image_emb, static_pos_emb, static_state_emb, static_mask = \
+                static_image_emb, static_pos_emb, static_state_emb, static_time_emb, static_mask = \
                     self.mem_buffer.prepare_random_sampling(
                         self.step_idx, token_budget, token_per_image, history_feats_gather_fn)
             elif self.config.perceptual_memory.type == "frame_sampling":
                 token_per_image = self.config.token_per_image
-                static_image_emb, static_pos_emb, static_state_emb, static_mask = \
+                static_image_emb, static_pos_emb, static_state_emb, static_time_emb, static_mask = \
                     self.mem_buffer.prepare_frame_sampling(
                         self.step_idx, token_budget, token_per_image, history_feats_gather_fn)
             else:
                 raise ValueError(f"Unknown perceptual_memory.type: {self.config.perceptual_memory.type}")
-            
+
             inputs["static_image_emb"] = static_image_emb
             inputs["static_pos_emb"] = static_pos_emb
             inputs["static_state_emb"] = self._normalize_state(static_state_emb)
+            inputs["static_time_emb"] = static_time_emb
             inputs["static_mask"] = static_mask
         else:
             raise ValueError(f"Not supported representation type: {self.config.representation_type}")

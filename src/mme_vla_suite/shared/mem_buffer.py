@@ -196,41 +196,43 @@ class MemoryBuffer:
         return kept_indices
     
     
-    def _prepare_token_dropping(self, history_feats, sorted_kept_indices, token_budget):
+    def _prepare_token_dropping(self, history_feats, sorted_kept_indices, token_budget, step_idx):
         img_emb = np.zeros((token_budget, self.img_emb_dim), dtype=np.float32)
         pos_emb = np.zeros((token_budget, self.pos_emb_dim), dtype=np.float32)
         state_emb = np.zeros((token_budget, self.state_emb_dim), dtype=np.float32)
+        time_emb = np.zeros((token_budget, 1), dtype=np.float32)
         mask = np.zeros((token_budget), dtype=np.bool_)
 
         for idx, (buffer_idx, view_idx, patch_idx) in enumerate(sorted_kept_indices[:token_budget]):
             img_emb[idx] = history_feats[buffer_idx][f"image_emb_8x8"][view_idx][patch_idx]
             pos_emb[idx] = history_feats[buffer_idx][f"pos_emb_8x8"][view_idx][patch_idx]
             state_emb[idx] = history_feats[buffer_idx]["state_emb"]
+            time_emb[idx, 0] = np.log1p(step_idx - buffer_idx)  # steps ago, log-compressed
             mask[idx] = True
-        
+
         # print("effective token length: ", np.sum(mask))
-                
-        return img_emb, pos_emb, state_emb, mask
-    
+
+        return img_emb, pos_emb, state_emb, time_emb, mask
+
 
     def prepare_token_dropping(self, step_idx, token_budget, history_feats_gather_fn, kept_indices=None, *args, **kwargs):
         if kept_indices is None:
             indices_to_load = self.get_token_dropping_indices()
         else:
             indices_to_load = kept_indices
-        
+
         sorted_kept_indices = self.filter_token_dropping_indices(
             indices_to_load, step_idx, token_budget, is_sorted=True)
-        
+
         indices_to_load = sorted(set([item[0] for item in sorted_kept_indices]))
         # print("step_idx: ", step_idx)
         # print(f"indices_to_load (length: {len(indices_to_load)}/{len(sorted_kept_indices)}): {indices_to_load}")
         # self._visualize_token_dropping(sorted_kept_indices, step_idx)
         # import pdb; pdb.set_trace()
-        
+
         history_feats = history_feats_gather_fn(indices_to_load, *args, **kwargs)
 
-        return self._prepare_token_dropping(history_feats, sorted_kept_indices, token_budget)
+        return self._prepare_token_dropping(history_feats, sorted_kept_indices, token_budget, step_idx)
     
     
     def _visualize_token_dropping(self, kept_indices, step_idx):
@@ -286,38 +288,43 @@ class MemoryBuffer:
         return even_sampling_indices(step_idx, max_size)
     
     
-    def _prepare_frame_sampling(self, history_feats, indices_to_load, token_budget, token_per_image):
+    def _prepare_frame_sampling(self, history_feats, indices_to_load, token_budget, token_per_image, step_idx):
         spatial_size = str(int(math.sqrt(token_per_image)))
         spatial_key = f"{spatial_size}x{spatial_size}"
         max_size = token_budget // (token_per_image * self.num_views)
-        
+
 
         sampled_img_emb = self._load_emb(history_feats, indices_to_load, f"image_emb_{spatial_key}")
         sampled_pos_emb = self._load_emb(history_feats, indices_to_load, f"pos_emb_{spatial_key}")
         sampled_state_emb = self._load_emb(history_feats, indices_to_load, "state_emb")
+        # steps ago per sampled frame, log-compressed so long episodes don't blow up the raw scale
+        sampled_time_emb = np.log1p(
+            step_idx - np.asarray(indices_to_load, dtype=np.float32)
+        )[:, None]
         mask = np.ones((sampled_img_emb.shape[0]), dtype=np.bool_)
-                
+
         # we use right padding to the perceptual memory
-        sampled_img_emb, sampled_pos_emb, sampled_state_emb, mask = right_padding_token_emb(
-            sampled_img_emb, sampled_pos_emb, sampled_state_emb, mask, max_size
+        sampled_img_emb, sampled_pos_emb, sampled_state_emb, sampled_time_emb, mask = right_padding_token_emb(
+            sampled_img_emb, sampled_pos_emb, sampled_state_emb, sampled_time_emb, mask, max_size
         )
-                
+
         img_emb =  np.reshape(sampled_img_emb, (-1, self.img_emb_dim))
         pos_emb = np.reshape(sampled_pos_emb, (-1, self.pos_emb_dim))
         mask = np.repeat(mask, self.num_views * token_per_image)
         state_emb = np.repeat(sampled_state_emb, self.num_views * token_per_image, axis=0)
-        
+        time_emb = np.repeat(sampled_time_emb, self.num_views * token_per_image, axis=0)
+
         # print("effective token length: ", np.sum(mask))
-                
-        return img_emb, pos_emb, state_emb, mask
-            
-    
+
+        return img_emb, pos_emb, state_emb, time_emb, mask
+
+
     def prepare_frame_sampling(self, step_idx, token_budget, token_per_image, history_feats_gather_fn,  *args, **kwargs):
         indices_to_load = self.get_frame_sampling_indices(step_idx, token_budget, token_per_image)
         # print("step_idx: ", step_idx, "indices_to_load: ", indices_to_load, "length: ", len(indices_to_load))
         # self._visualize_frame_sampling(indices_to_load, step_idx)
         history_feats = history_feats_gather_fn(indices_to_load, *args, **kwargs)
-        return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image)
+        return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image, step_idx)
 
 
     def get_random_sampling_indices(self, step_idx, token_budget, token_per_image, rng=None):
@@ -334,7 +341,7 @@ class MemoryBuffer:
         indices_to_load = self.get_random_sampling_indices(step_idx, token_budget, token_per_image, rng=rng)
         history_feats = history_feats_gather_fn(indices_to_load, *args, **kwargs)
         # packing/padding only depends on *which* indices were chosen, not how -- reuse it as-is.
-        return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image)
+        return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image, step_idx)
 
 
     def _visualize_frame_sampling(self, indices_to_load, step_idx):

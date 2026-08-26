@@ -63,6 +63,7 @@ class RoboMMEInputs(transforms.DataTransformFn):
             "static_image_emb": data.get("static_image_emb", None), # (budget, d1)
             "static_pos_emb": data.get("static_pos_emb", None), # (budget, d2)
             "static_state_emb": data.get("static_state_emb", None), # (budget, d3)
+            "static_time_emb": data.get("static_time_emb", None), # (budget, d4)
             "static_mask": data.get("static_mask", None), # (budget)
             # recurrent memory
             "recur_image_emb": data.get("recur_image_emb", None), # (max_recur_steps, views, p, d1)

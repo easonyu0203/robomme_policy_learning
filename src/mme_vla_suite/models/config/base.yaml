@@ -7,6 +7,7 @@ pool_type: mean
 
 use_pos_emb: true   # If true, will concatenate position embedding to the image embedding
 use_state_emb: false # If true, will concatenate state embedding to the image embedding
+use_time_emb: false # If true, will concatenate a recency ("steps ago") embedding to the image embedding
 
 memory_feature:
   img:
@@ -18,6 +19,9 @@ memory_feature:
   state:
     input_dim: 8  # Robot State embedding size for Panda
     hidden_dim: 512
+  time:
+    input_dim: 1  # raw log1p(steps-ago) scalar
+    hidden_dim: 64
 
 
 integration_type: input # [input, modulation, expert]

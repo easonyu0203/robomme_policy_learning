@@ -15,13 +15,17 @@ class FeatureEncoder(nnx.Module):
         pos_output_dim,
         state_input_dim,
         state_output_dim,
+        time_input_dim=1,
+        time_output_dim=64,
         output_dim_for_percep=None,
         ouput_dim_for_recur=None,
         use_pos_emb=True,
         use_state_emb=False,
+        use_time_emb=False,
     ):
         self.use_pos_emb = use_pos_emb
         self.use_state_emb = use_state_emb
+        self.use_time_emb = use_time_emb
         input_dim = image_input_dim
         if use_state_emb:
             self.state_proj = nnx.Linear(
@@ -41,6 +45,15 @@ class FeatureEncoder(nnx.Module):
                 kernel_init=kernel_init,
             )
             input_dim += pos_output_dim
+        if use_time_emb:
+            self.time_proj = nnx.Linear(
+                time_input_dim,
+                time_output_dim,
+                rngs=rngs,
+                dtype=dtype,
+                kernel_init=kernel_init,
+            )
+            input_dim += time_output_dim
 
         if output_dim_for_percep is not None:
             self.encoder_static = nnx.Linear(
@@ -85,7 +98,16 @@ class FeatureEncoder(nnx.Module):
         else:
             state_emb = nnx.silu(self.state_proj(state_emb))
             base_emb = jnp.concatenate([base_emb, state_emb], axis=-1)
-            
+
+        return base_emb
+
+    def _add_time_emb(
+        self,
+        base_emb,
+        time_emb,
+    ):
+        time_emb = nnx.silu(self.time_proj(time_emb))
+        base_emb = jnp.concatenate([base_emb, time_emb], axis=-1)
         return base_emb
 
     def _encode_memory(
@@ -93,6 +115,7 @@ class FeatureEncoder(nnx.Module):
         image_emb,
         pos_emb,
         state_emb,
+        time_emb,
         encoder_fn,
     ):
         input_emb = image_emb
@@ -100,6 +123,8 @@ class FeatureEncoder(nnx.Module):
             input_emb = self._add_pos_emb(input_emb, pos_emb)
         if self.use_state_emb and state_emb is not None:
             input_emb = self._add_state_emb(input_emb, state_emb)
+        if self.use_time_emb and time_emb is not None:
+            input_emb = self._add_time_emb(input_emb, time_emb)
         input_emb = encoder_fn(input_emb)
         return input_emb
 
@@ -108,6 +133,7 @@ class FeatureEncoder(nnx.Module):
         static_image_emb: at.Float[at.Array, "b l d1"],
         static_pos_emb: at.Float[at.Array, "b l d2"],
         static_state_emb: at.Float[at.Array, "b l d3"],
+        static_time_emb: at.Float[at.Array, "b l d4"] | None = None,
         *args,
         **kwargs,
     ):
@@ -115,6 +141,7 @@ class FeatureEncoder(nnx.Module):
             static_image_emb,
             static_pos_emb,
             static_state_emb,
+            static_time_emb,
             self.encoder_static,
         )
 
@@ -130,5 +157,6 @@ class FeatureEncoder(nnx.Module):
             recurrent_image_emb,
             recurrent_pos_emb,
             recurrent_state_emb,
+            None,
             self.encoder_recur,
         )

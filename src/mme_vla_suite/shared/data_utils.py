@@ -18,6 +18,7 @@ def right_padding_token_emb(
     sampled_img_emb, # (l v p d1)
     sampled_pos_emb, # (l v p d2)
     sampled_state_emb, # (l d3)
+    sampled_time_emb, # (l d4)
     mask, # (l)
     max_size: int):
     if sampled_img_emb.shape[0] < max_size:
@@ -54,6 +55,17 @@ def right_padding_token_emb(
             ],
             axis=0,
         )
+        pad_time = max_size - sampled_time_emb.shape[0]
+        sampled_time_emb = np.concatenate(
+            [
+                sampled_time_emb,
+                np.zeros(
+                    (pad_time, *sampled_time_emb.shape[1:]),
+                    dtype=sampled_time_emb.dtype,
+                ),
+            ],
+            axis=0,
+        )
         mask = np.concatenate(
             [mask, np.zeros((max_size - mask.shape[0]), dtype=np.bool_)], axis=0
         )
@@ -61,8 +73,9 @@ def right_padding_token_emb(
         sampled_img_emb = sampled_img_emb[:max_size]
         sampled_pos_emb = sampled_pos_emb[:max_size]
         sampled_state_emb = sampled_state_emb[:max_size]
+        sampled_time_emb = sampled_time_emb[:max_size]
         mask = mask[:max_size]
-    return sampled_img_emb, sampled_pos_emb, sampled_state_emb, mask
+    return sampled_img_emb, sampled_pos_emb, sampled_state_emb, sampled_time_emb, mask
 
 
 

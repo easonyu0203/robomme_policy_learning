@@ -348,6 +348,7 @@ class RoboMMEDataConfig(DataConfigFactory):
                         "static_image_emb": "static_image_emb", # (b, l, d1)
                         "static_pos_emb": "static_pos_emb", # (b, l, d2)
                         "static_state_emb": "static_state_emb", # (b, l, d3)
+                        "static_time_emb": "static_time_emb", # (b, l, d4)
                         "static_mask": "static_mask", # (b, l)
                         # recurrent memory
                         "recur_image_emb": "recur_image_emb", # (b, t, v, p, d1)
@@ -404,6 +405,7 @@ class LeRobotMMEVLARealRobotDataConfig(DataConfigFactory):
                         "static_image_emb": "static_image_emb", # (b, l, d1)
                         "static_pos_emb": "static_pos_emb", # (b, l, d2)
                         "static_state_emb": "static_state_emb", # (b, l, d3)
+                        "static_time_emb": "static_time_emb", # (b, l, d4)
                         "static_mask": "static_mask", # (b, l)
                         # recurrent memory
                         "recur_image_emb": "recur_image_emb", # (b, t, v, p, d1)

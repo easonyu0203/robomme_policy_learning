@@ -23,6 +23,7 @@ class HistAugObservation(_Observation):
     static_mask: at.Bool[at.Array, "b l1"] | None = None
     static_pos_emb: at.Float[at.Array, "b l1 d2"] | None = None
     static_state_emb: at.Float[at.Array, "b l1 d3"] | None = None
+    static_time_emb: at.Float[at.Array, "b l1 d4"] | None = None
 
     # for recurrent memory
     recur_image_emb: at.Float[at.Array, "b t v p d1"] | None = None  # left padded
@@ -51,6 +52,7 @@ class HistAugObservation(_Observation):
             static_mask=data.get("static_mask", None),
             static_pos_emb=data.get("static_pos_emb", None),
             static_state_emb=data.get("static_state_emb", None),
+            static_time_emb=data.get("static_time_emb", None),
             recur_image_emb=data.get("recur_image_emb", None),
             recur_mask=data.get("recur_mask", None),
             recur_pos_emb=data.get("recur_pos_emb", None),
@@ -67,6 +69,7 @@ class HistAugObservation(_Observation):
         result["static_mask"] = self.static_mask
         result["static_pos_emb"] = self.static_pos_emb
         result["static_state_emb"] = self.static_state_emb
+        result["static_time_emb"] = self.static_time_emb
         result["recur_image_emb"] = self.recur_image_emb
         result["recur_mask"] = self.recur_mask
         result["recur_pos_emb"] = self.recur_pos_emb
@@ -94,6 +97,7 @@ class HistAugObservation(_Observation):
         static_mask: at.Bool[ArrayT, "*b l"] | None = None,
         static_pos_emb: at.Float[ArrayT, "*b l d2"] | None = None,
         static_state_emb: at.Float[ArrayT, "*b l d3"] | None = None,
+        static_time_emb: at.Float[ArrayT, "*b l d4"] | None = None,
         recur_image_emb: at.Float[ArrayT, "*b t v p d1"] | None = None,
         recur_mask: at.Bool[ArrayT, "*b t"] | None = None,
         recur_pos_emb: at.Float[ArrayT, "*b t v p d2"] | None = None,
@@ -113,6 +117,7 @@ class HistAugObservation(_Observation):
             static_mask=static_mask,
             static_pos_emb=static_pos_emb,
             static_state_emb=static_state_emb,
+            static_time_emb=static_time_emb,
             recur_image_emb=recur_image_emb,
             recur_mask=recur_mask,
             recur_pos_emb=recur_pos_emb,
@@ -140,6 +145,7 @@ def preprocess_observation(
         static_mask=observation.static_mask,
         static_pos_emb=observation.static_pos_emb,
         static_state_emb=observation.static_state_emb,
+        static_time_emb=observation.static_time_emb,
         recur_image_emb=observation.recur_image_emb,
         recur_mask=observation.recur_mask,
         recur_pos_emb=observation.recur_pos_emb,

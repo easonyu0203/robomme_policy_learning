@@ -152,6 +152,14 @@ class HistoryPi0Config(Pi0Config):
                             ],
                             jnp.float32,
                         ),
+                        static_time_emb=jax.ShapeDtypeStruct(
+                            [
+                                batch_size,
+                                self.history_config.budget,
+                                self.history_config.memory_feature.time.input_dim,
+                            ],
+                            jnp.float32,
+                        ),
                     )
                 elif self.history_config.representation_type == "recurrent":
                     observation_spec = HistAugObservation.from_base_obs(
@@ -406,6 +414,7 @@ class HistoryPi0(BaseModel):
                 obs.static_image_emb,
                 obs.static_pos_emb,
                 obs.static_state_emb,
+                obs.static_time_emb,
                 obs.static_mask,
                 train=train,
                 rng=rng,

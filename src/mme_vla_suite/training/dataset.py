@@ -230,6 +230,7 @@ class RoboMMEDataset(Dataset):
                         static_img_emb,
                         static_pos_emb,
                         static_state_emb,
+                        static_time_emb,
                         static_mask, # >=64
                     ) = self.prepare_token_drop(epis_idx, step_idx)
                 elif self.history_config.perceptual_memory.type == "random_sampling":
@@ -237,6 +238,7 @@ class RoboMMEDataset(Dataset):
                         static_img_emb,
                         static_pos_emb,
                         static_state_emb,
+                        static_time_emb,
                         static_mask,
                     ) = self.prepare_random_sampling(epis_idx, step_idx)
                 elif self.history_config.perceptual_memory.type == "frame_sampling":
@@ -244,16 +246,18 @@ class RoboMMEDataset(Dataset):
                         static_img_emb,
                         static_pos_emb,
                         static_state_emb,
+                        static_time_emb,
                         static_mask, # slow >=64, mid >=16,fast >=4
                     ) = self.prepare_frame_sampling(epis_idx, step_idx)
                 else:
                     raise ValueError(
                         f"Unknown perceptual_memory.type: {self.history_config.perceptual_memory.type}"
                     )
-                
+
                 data["static_image_emb"] = static_img_emb
                 data["static_pos_emb"] = static_pos_emb
                 data["static_state_emb"] = self._normalize_state(static_state_emb)
+                data["static_time_emb"] = static_time_emb
                 data["static_mask"] = static_mask
 
             elif self.history_config.representation_type == "recurrent":             
@@ -279,6 +283,7 @@ class RoboMMEDataset(Dataset):
             "static_image_emb",
             "static_pos_emb",
             "static_state_emb",
+            "static_time_emb",
             "static_mask",
             
             "recur_image_emb",
