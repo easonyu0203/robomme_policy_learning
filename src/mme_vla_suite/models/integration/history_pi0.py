@@ -80,13 +80,17 @@ class HistoryPi0Config(Pi0Config):
 
     use_history: bool = False  # Use history or not
     history_config: str | None = None  # history config
+    # Dotlist overrides into the loaded history_config yaml, e.g.
+    # "perceptual_memory.selector.ratio_loss_weight=0.1" -- lets a sweep
+    # tweak nested yaml values from the CLI without a new yaml per variant.
+    history_config_overrides: tuple[str, ...] = ()
     max_token_len: int = 64
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "HistoryPi0":
         # Load the history config if it's specified
         if self.history_config is not None:
-            loaded_config = get_history_config(self.history_config)
+            loaded_config = get_history_config(self.history_config, self.history_config_overrides)
             # Create a new config with the loaded history config
             config_with_loaded_history = dataclasses.replace(self, history_config=loaded_config)
             

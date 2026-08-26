@@ -235,7 +235,9 @@ class ModelTransformFactory(GroupFactory):
                 max_token_len = model_config.max_token_len
                 
                 if model_config.use_history and model_config.history_config is not None:
-                    loaded_config = get_history_config(model_config.history_config)
+                    loaded_config = get_history_config(
+                        model_config.history_config, model_config.history_config_overrides
+                    )
 
                     if loaded_config.representation_type == "symbolic":
                         symbolic_memory_type = loaded_config.symbolic_memory.type
