@@ -30,6 +30,9 @@ perceptual_memory:
     depth: 2 # selector transformer depth -- kept small relative to the backbone
     num_heads: 8
     num_register_tokens: 4
-    ratio_loss_weight: 2.0
+    # "lbfix2" weights: DynamicViT's ratio_loss_weight=2.0 let the router collapse
+    # (load_balance_loss pinned at 0.25, ratio_loss ~0) -- see randSamp2hardSel.
+    # 0.001 / 1e-4 trains the router cleanly (lb_loss ~0.01) with a lower action loss.
+    ratio_loss_weight: 0.001
     z_loss_weight: 1e-4
-    load_balance_loss_weight: 0.0
+    load_balance_loss_weight: 1e-4
