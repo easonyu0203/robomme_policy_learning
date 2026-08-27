@@ -354,7 +354,13 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
     init_history_config(config)
-    history_config = get_history_config(config.model.history_config)
+    # Resolve with the CLI dotlist overrides so the dataloader sees the same
+    # history_config the model does -- an override that changes budget /
+    # pool_budget / token_per_image / keep_ratio otherwise silently reaches
+    # only the model and shape-mismatches the batch.
+    history_config = get_history_config(
+        config.model.history_config, config.model.history_config_overrides
+    )
     
     if history_config:
         if history_config.streaming_obs_horizon == 16:
@@ -368,7 +374,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     data_loader = _data_loader.create_data_loader(
         config.dataset_path,
         data_config,
-        history_config=config.model.history_config,
+        history_config=history_config,
         sharding=data_sharding,
         shuffle=True,
         action_horizon=config.model.action_horizon,
