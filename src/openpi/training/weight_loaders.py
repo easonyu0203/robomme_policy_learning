@@ -84,8 +84,12 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     Returns:
         A new dictionary with the merged parameters.
     """
-    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
-    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    # Flatten to tuple keys (no `sep`), not "/"-joined strings: an nnx module
+    # with a list attribute (e.g. Selector.blocks) produces int path segments,
+    # which "/".join() rejects. Keys are matched as tuples; missing_regex is
+    # applied to their "/"-joined string form.
+    flat_ref = flax.traverse_util.flatten_dict(params)
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params)
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
@@ -97,10 +101,10 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
 
     # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
-    for k in {k for k in flat_ref if pattern.fullmatch(k)}:
+    for k in {k for k in flat_ref if pattern.fullmatch("/".join(map(str, k)))}:
         if k not in result:
             if flat_ref[k] is not None:
-                logger.info(f"Merging missing weight: {k}, shape: {flat_ref[k].shape}, dtype: {flat_ref[k].dtype}")
+                logger.info(f"Merging missing weight: {'/'.join(map(str, k))}, shape: {flat_ref[k].shape}, dtype: {flat_ref[k].dtype}")
             result[k] = flat_ref[k]
 
-    return flax.traverse_util.unflatten_dict(result, sep="/")
+    return flax.traverse_util.unflatten_dict(result)
