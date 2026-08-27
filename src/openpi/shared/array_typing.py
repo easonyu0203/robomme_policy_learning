@@ -61,10 +61,30 @@ def disable_typechecking():
     config.update("jaxtyping_disable", initial)
 
 
+def _normalize_numeric_dict_keys(tree):
+    # A dict node keyed 0,1,... (from a plain-list nnx submodule container) and one keyed
+    # "0","1",... (from a dict-of-str-index container) are the same structure for loading
+    # purposes -- replace_by_pure_dict's own key handling treats them interchangeably -- but
+    # jax's pytree equality check treats int vs numeric-string keys as a real mismatch. Collapse
+    # both to a canonical string form before comparing so this doesn't look like a structural diff.
+    if isinstance(tree, dict):
+        keys = list(tree.keys())
+        if keys and all(isinstance(k, int) or (isinstance(k, str) and k.isdigit()) for k in keys):
+            return {str(int(k)): _normalize_numeric_dict_keys(v) for k, v in tree.items()}
+        return {k: _normalize_numeric_dict_keys(v) for k, v in tree.items()}
+    if isinstance(tree, list):
+        return [_normalize_numeric_dict_keys(v) for v in tree]
+    if isinstance(tree, tuple):
+        return tuple(_normalize_numeric_dict_keys(v) for v in tree)
+    return tree
+
+
 def check_pytree_equality(*, expected: PyTree, got: PyTree, check_shapes: bool = False, check_dtypes: bool = False):
     """Checks that two PyTrees have the same structure and optionally checks shapes and dtypes. Creates a much nicer
     error message than if `jax.tree.map` is naively used on PyTrees with different structures.
     """
+    expected = _normalize_numeric_dict_keys(expected)
+    got = _normalize_numeric_dict_keys(got)
 
     if errors := list(private_tree_util.equality_errors(expected, got)):
         raise ValueError(
