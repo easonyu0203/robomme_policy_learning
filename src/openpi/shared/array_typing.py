@@ -63,10 +63,18 @@ def disable_typechecking():
 
 def _normalize_numeric_dict_keys(tree):
     # A dict node keyed 0,1,... (from a plain-list nnx submodule container) and one keyed
-    # "0","1",... (from a dict-of-str-index container) are the same structure for loading
-    # purposes -- replace_by_pure_dict's own key handling treats them interchangeably -- but
+    # "0","1",... (from a dict-of-str-index container) are the same structure conceptually, but
     # jax's pytree equality check treats int vs numeric-string keys as a real mismatch. Collapse
     # both to a canonical string form before comparing so this doesn't look like a structural diff.
+    # NOTE: this fixes check_pytree_equality specifically, not loading in general -- nnx's
+    # replace_by_pure_dict does its own independent, unconditional int-coercion on incoming keys
+    # (try_convert_int) *after* this check passes, and does NOT treat int/string keys as
+    # interchangeable the way this function's docstring-adjacent comment used to imply: loading a
+    # string-keyed dict (e.g. Selector.blocks, e8402e5) into a live state whose flat_state() keys
+    # are also genuinely string still fails inside replace_by_pure_dict with "key in pure_dict not
+    # available in state", independent of whether this equality check passes. Verified via a
+    # direct minimal repro by robomme-policy-learning-71, 2026-08-27. Fixing that side would mean
+    # patching flax-internal behavior, not attempted here.
     if isinstance(tree, dict):
         keys = list(tree.keys())
         if keys and all(isinstance(k, int) or (isinstance(k, str) and k.isdigit()) for k in keys):
