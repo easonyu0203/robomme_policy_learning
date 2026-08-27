@@ -147,6 +147,23 @@ class RoboMMEDataset(Dataset):
             epis_idx=epis_idx)
 
 
+    def prepare_hierarchical_selection(self, epis_idx, step_idx):
+        # Ships a `pool_budget`-wide frame pool; the model's selector then
+        # hierarchically reduces it down to `budget` (percep_mem.py). Same packing
+        # as frame_sampling/random_sampling, just a larger token budget.
+        token_per_image = self.history_config.token_per_image
+        pool_budget = self.history_config.pool_budget
+        pool_sampling = self.history_config.perceptual_memory.get("pool_sampling", "even")
+
+        prepare = (
+            self.mem_buffer.prepare_random_sampling
+            if pool_sampling == "random"
+            else self.mem_buffer.prepare_frame_sampling
+        )
+        return prepare(
+            step_idx, pool_budget, token_per_image, self._gather_history_feat,
+            epis_idx=epis_idx)
+
 
     def prepare_token_recurrent(self, epis_idx, step_idx, exec_start_idx):
         self.mem_buffer.exec_start_idx = exec_start_idx
@@ -249,6 +266,14 @@ class RoboMMEDataset(Dataset):
                         static_time_emb,
                         static_mask, # slow >=64, mid >=16,fast >=4
                     ) = self.prepare_frame_sampling(epis_idx, step_idx)
+                elif self.history_config.perceptual_memory.type == "hierarchical_selection":
+                    (
+                        static_img_emb,
+                        static_pos_emb,
+                        static_state_emb,
+                        static_time_emb,
+                        static_mask, # pool_budget-wide, right-padded
+                    ) = self.prepare_hierarchical_selection(epis_idx, step_idx)
                 else:
                     raise ValueError(
                         f"Unknown perceptual_memory.type: {self.history_config.perceptual_memory.type}"

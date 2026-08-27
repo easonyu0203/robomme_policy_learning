@@ -126,24 +126,29 @@ class HistoryPi0Config(Pi0Config):
                         ),
                     )
                 elif self.history_config.representation_type == "perceptual":
+                    # hierarchical_selection ships a `pool_budget`-wide pool that the
+                    # model reduces internally; every other mode ships `budget`.
+                    mem_len = self.history_config.get(
+                        "pool_budget", self.history_config.budget
+                    )
                     observation_spec = HistAugObservation.from_base_obs(
                         base_obs_spec,
                         static_image_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
-                                self.history_config.budget,
+                                mem_len,
                                 self.history_config.memory_feature.img.input_dim,
                             ],
                             jnp.float32,
                         ),
                         static_mask=jax.ShapeDtypeStruct(
-                            [batch_size, self.history_config.budget],
+                            [batch_size, mem_len],
                             jnp.bool_,
                         ),
                         static_pos_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
-                                self.history_config.budget,
+                                mem_len,
                                 self.history_config.memory_feature.pos.input_dim,
                             ],
                             jnp.float32,
@@ -151,7 +156,7 @@ class HistoryPi0Config(Pi0Config):
                         static_state_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
-                                self.history_config.budget,
+                                mem_len,
                                 self.history_config.memory_feature.state.input_dim,
                             ],
                             jnp.float32,
@@ -159,7 +164,7 @@ class HistoryPi0Config(Pi0Config):
                         static_time_emb=jax.ShapeDtypeStruct(
                             [
                                 batch_size,
-                                self.history_config.budget,
+                                mem_len,
                                 self.history_config.memory_feature.time.input_dim,
                             ],
                             jnp.float32,

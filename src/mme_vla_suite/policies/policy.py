@@ -157,6 +157,17 @@ class MME_VLA_Policy:
                 static_image_emb, static_pos_emb, static_state_emb, static_time_emb, static_mask = \
                     self.mem_buffer.prepare_frame_sampling(
                         self.step_idx, token_budget, token_per_image, history_feats_gather_fn)
+            elif self.config.perceptual_memory.type == "hierarchical_selection":
+                # Same frame pool as training; the selector reduces it in-model.
+                token_per_image = self.config.token_per_image
+                pool_sampling = self.config.perceptual_memory.get("pool_sampling", "even")
+                prepare = (
+                    self.mem_buffer.prepare_random_sampling
+                    if pool_sampling == "random"
+                    else self.mem_buffer.prepare_frame_sampling
+                )
+                static_image_emb, static_pos_emb, static_state_emb, static_time_emb, static_mask = \
+                    prepare(self.step_idx, self.config.pool_budget, token_per_image, history_feats_gather_fn)
             else:
                 raise ValueError(f"Unknown perceptual_memory.type: {self.config.perceptual_memory.type}")
 

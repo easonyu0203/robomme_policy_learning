@@ -1,4 +1,5 @@
 import flax.nnx as nnx
+import jax
 import jax.numpy as jnp
 
 
@@ -43,6 +44,16 @@ class PerceptualMemory(nnx.Module):
             use_time_emb=use_time_emb,
         )
 
+        # `hierarchical_selection` ships a `pool_budget`-wide token pool that the
+        # selector reduces down to `budget` (no gradient) before the trained cut;
+        # every other mode ships exactly `budget` tokens.
+        self.is_hierarchical = self.mem_type == "hierarchical_selection"
+        self.input_len = (
+            config.get("pool_budget", config.budget)
+            if self.is_hierarchical
+            else config.budget
+        )
+
         selector_cfg = config.perceptual_memory.get("selector", None)
         self.use_selector = selector_cfg is not None and selector_cfg.get("enabled", False)
         if self.use_selector:
@@ -57,6 +68,75 @@ class PerceptualMemory(nnx.Module):
             self.keep_ratio = selector_cfg.get("keep_ratio", 0.5)
             self.num_keep = round(config.budget * self.keep_ratio)
 
+        if self.is_hierarchical:
+            assert self.use_selector, "hierarchical_selection requires perceptual_memory.selector.enabled"
+            # Each reduction round groups the sequence into contiguous
+            # `reduce_chunk_size` chunks and keeps `reduce_chunk_keep` of each
+            # (caltech hard_vit.py::_select_chunks). A full chunk must strictly
+            # shrink or the loop never terminates.
+            self.reduce_chunk_size = config.budget
+            self.reduce_chunk_keep = round(
+                self.reduce_chunk_size * selector_cfg.get("reduce_keep_ratio", self.keep_ratio)
+            )
+            assert 0 < self.reduce_chunk_keep < self.reduce_chunk_size, (
+                f"reduce_keep_ratio gives {self.reduce_chunk_keep}/{self.reduce_chunk_size} per "
+                "chunk; must be strictly inside (0, chunk_size) or the reduction never shrinks"
+            )
+            # Round count is a pure function of the static config -- precompute it
+            # so the reduction loop unrolls at trace time (no lax.while_loop, no
+            # dynamic shapes).
+            n = self.input_len
+            self.n_reduce_rounds = 0
+            while n > config.budget:
+                n = -(-n // self.reduce_chunk_size) * self.reduce_chunk_keep
+                self.n_reduce_rounds += 1
+            self.reduced_len = n
+            assert self.num_keep <= self.reduced_len, (
+                f"final cut keeps {self.num_keep} tokens but the reduction only yields "
+                f"{self.reduced_len} (pool_budget={self.input_len}, budget={config.budget})"
+            )
+
+    def _hierarchical_reduce(
+        self, hidden: at.Float[at.Array, "b l d"], valid: at.Bool[at.Array, "b l"]
+    ) -> tuple[at.Float[at.Array, "b lr d"], at.Bool[at.Array, "b lr"]]:
+        """caltech hard_vit.py::_hierarchical_reduce, adapted to JAX / static shapes.
+
+        Repeatedly splits the sequence into contiguous `reduce_chunk_size` chunks
+        (folded into the batch dim -> one Selector call per round) and keeps the
+        top `reduce_chunk_keep` of each by keep-margin. Scoring is stop_gradient
+        -- this stage is preprocessing -- but the survivor gather stays
+        differentiable, so the FeatureEncoder still learns from whichever tokens
+        reach the trained cut. `self.n_reduce_rounds` is static, so this loop
+        unrolls at trace time (no dynamic shapes, no lax.while_loop).
+
+        An all-padding chunk (short episode) produces NaN scores from the
+        all-masked attention, but `select_topk` maps its -inf margins to
+        arbitrary indices whose gathered tokens carry `valid=False`; the NaN
+        never leaves the (stop_gradient'd) scoring path.
+        """
+        chunk, keep = self.reduce_chunk_size, self.reduce_chunk_keep
+        b = hidden.shape[0]
+        n = hidden.shape[1]
+        for _ in range(self.n_reduce_rounds):
+            n_chunks = -(-n // chunk)  # ceil
+            pad = n_chunks * chunk - n
+            if pad:
+                hidden = jnp.pad(hidden, ((0, 0), (0, pad), (0, 0)))
+                valid = jnp.pad(valid, ((0, 0), (0, pad)))
+            dim = hidden.shape[-1]
+            hc = hidden.reshape(b * n_chunks, chunk, dim)
+            vc = valid.reshape(b * n_chunks, chunk)
+            # Scoring: no gradient to the selector params or to `hc` via this path.
+            logits = jax.lax.stop_gradient(self.selector(hc, vc))
+            idx = select_topk(logits, vc, keep)  # (b*n_chunks, keep) int
+            # Gather: differentiable w.r.t. `hidden` for the surviving tokens.
+            hc = batch_gather(hc, idx)
+            vc = batch_gather(vc[..., None], idx)[..., 0]
+            n = n_chunks * keep
+            hidden = hc.reshape(b, n, dim)
+            valid = vc.reshape(b, n)
+        return hidden, valid
+
     def __call__(
         self,
         static_image_emb: at.Float[at.Array, "b l d1"],
@@ -69,7 +149,7 @@ class PerceptualMemory(nnx.Module):
         rng: at.KeyArrayLike | None = None,
     ):
         # get memory tokens using feature encoder
-        assert static_image_emb.shape[1] == self.config.budget
+        assert static_image_emb.shape[1] == self.input_len
 
         hidden_states = self.feature_encoder.encode_perceptual_memory(
             static_image_emb, static_pos_emb, static_state_emb, static_time_emb
@@ -83,6 +163,23 @@ class PerceptualMemory(nnx.Module):
             if static_mask is not None
             else jnp.ones(hidden_states.shape[:2], dtype=jnp.bool_)
         )
+
+        extra_stats = {}
+        if self.is_hierarchical:
+            # No-grad hierarchical reduction: pool_budget -> reduced_len (<= budget).
+            # Only the trained cut below sees gradient ("train it only at the last
+            # reduction layer").
+            real_before = valid_mask.sum(axis=1)
+            hidden_states, valid_mask = self._hierarchical_reduce(hidden_states, valid_mask)
+            real_after = valid_mask.sum(axis=1)
+            # Fraction of real (non-padding) tokens that survived the reduction --
+            # 1.0 means nothing real was dropped; low values mean the pool held
+            # more real tokens than the reduction target and the selector had to
+            # choose. Diagnostic only.
+            extra_stats["reduce_keep_frac"] = jax.lax.stop_gradient(
+                jnp.mean(real_after / jnp.clip(real_before, a_min=1.0))
+            )
+
         logits = self.selector(hidden_states, valid_mask)
 
         if train:
@@ -94,7 +191,7 @@ class PerceptualMemory(nnx.Module):
             # all the way back to the selector's logits.
             mem_weight = decision * valid_mask.astype(hidden_states.dtype)
             losses = selector_losses(logits, decision, valid_mask, self.keep_ratio)
-            return hidden_states, mem_weight, losses
+            return hidden_states, mem_weight, {**losses, **extra_stats}
 
         # Eval: deterministic top-k by keep margin, physically gathered --
         # the only place the sequence actually shortens (the real
@@ -102,5 +199,8 @@ class PerceptualMemory(nnx.Module):
         topk_idx = select_topk(logits, valid_mask, self.num_keep)
         gathered_states = batch_gather(hidden_states, topk_idx)
         gathered_mask = batch_gather(valid_mask, topk_idx).astype(hidden_states.dtype)
-        stats = {"keep_frac": jnp.asarray(self.num_keep / self.config.budget, dtype=hidden_states.dtype)}
+        stats = {
+            "keep_frac": jnp.asarray(self.num_keep / self.config.budget, dtype=hidden_states.dtype),
+            **extra_stats,
+        }
         return gathered_states, gathered_mask, stats
