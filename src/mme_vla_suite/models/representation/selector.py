@@ -129,9 +129,9 @@ class Selector(nnx.Module):
         self.register_tokens = nnx.Param(
             jax.random.normal(rngs.params(), (num_register_tokens, dim), dtype=dtype) * 0.02
         )
-        self.blocks = {
-            str(i): _SelectorBlock(dim, num_heads, mlp_ratio, rngs=rngs, dtype=dtype) for i in range(depth)
-        }
+        self.blocks = [
+            _SelectorBlock(dim, num_heads, mlp_ratio, rngs=rngs, dtype=dtype) for _ in range(depth)
+        ]
         self.norm = nnx.LayerNorm(dim, rngs=rngs, dtype=dtype)
         self.head = nnx.Linear(dim, 2, rngs=rngs, dtype=dtype, kernel_init=kernel_init)
 
@@ -145,7 +145,7 @@ class Selector(nnx.Module):
         register_valid = jnp.ones((B, self.num_register_tokens), dtype=jnp.bool_)
         attn_mask = jnp.concatenate([valid_mask, register_valid], axis=1)
 
-        for i in range(len(self.blocks)):
-            x = self.blocks[str(i)](x, attn_mask)
+        for block in self.blocks:
+            x = block(x, attn_mask)
         x = self.norm(x)
         return self.head(x[:, :L])  # (B, L, 2): [keep_logit, drop_logit]

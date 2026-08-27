@@ -37,6 +37,7 @@ class Args:
     max_steps: int = 1300
     save_dir: str = "runs/evaluation"
     overwrite: bool = False
+    save_video: bool = True  # off for cheap intermediate-checkpoint sweeps; keep on for the checkpoint you want to visually inspect
 
     use_history: bool = True
     policy_name: str = "dummy_test"
@@ -160,7 +161,7 @@ class EpisodeEvaluator:
         pre_traj = env_runner.get_init_obs()
         task_goal = pre_traj["task_goal"]
 
-        recorder = RolloutRecorder(video_save_dir, task_goal, fps=30)
+        recorder = RolloutRecorder(video_save_dir, task_goal, fps=30, enabled=self.args.save_video)
 
         print(f"task_goal: {task_goal}")
 

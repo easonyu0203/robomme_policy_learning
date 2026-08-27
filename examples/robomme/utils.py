@@ -84,9 +84,11 @@ class EpisodeState:
 
 
 class RolloutRecorder:
-    def __init__(self, save_dir: str, task_goal: str, fps: int = 30):
+    def __init__(self, save_dir: str, task_goal: str, fps: int = 30, enabled: bool = True):
         self.save_dir = save_dir
-        save_dir.mkdir(parents=True, exist_ok=True)
+        self.enabled = enabled
+        if self.enabled:
+            save_dir.mkdir(parents=True, exist_ok=True)
         self.total_images = []
         self.fps = fps
         self.task_goal = task_goal
@@ -99,7 +101,9 @@ class RolloutRecorder:
         return points
         
     def record(self, image: np.ndarray, wrist_image: np.ndarray, state: np.ndarray, action: np.ndarray=None, is_video_demo: bool=False, subgoal: Optional[str] = None):
-        
+        if not self.enabled:
+            return
+
         concat_image = np.concatenate([image, wrist_image], axis=1)
         if is_video_demo: # add a red border
             concat_image = cv2.rectangle(concat_image, (0, 0), (concat_image.shape[1], concat_image.shape[0]), (255, 0, 0), 10)
@@ -163,4 +167,6 @@ class RolloutRecorder:
         return text_area
              
     def save_video(self, filename: str):
+        if not self.enabled:
+            return
         imageio.mimsave(os.path.join(self.save_dir, filename), self.total_images, fps=self.fps)
