@@ -114,6 +114,45 @@ def test_shapes_and_finite():
     print("OK shapes_and_finite")
 
 
+def test_eval_keep_all():
+    """`selector.eval_keep_all` -> eval skips the final trained cut and returns a
+    keep-weight equal to the post-reduction valid mask (nothing else dropped).
+    Reduction rounds still run; train path is unchanged."""
+    for pool_budget, n_rounds in ((512, 0), (1024, 1)):
+        model, cfg = build(pool_budget=pool_budget,
+                           **{"perceptual_memory.selector.eval_keep_all": True})
+        dim = cfg.memory_token_dim
+        assert model.eval_keep_all and model.n_reduce_rounds == n_rounds
+        base, _ = build(pool_budget=pool_budget)  # same arch, cut NOT skipped
+
+        for n_real in (300, 700, None):
+            img, pos, state, time, mask = rand_inputs(cfg, n_real=n_real, seed=n_real or 1)
+
+            gh, gm, _ = _forward(model, img, pos, state, time, mask,
+                                 train=False, rng=jax.random.key(1))
+            assert gh.shape == (2, cfg.budget, dim), (pool_budget, gh.shape)
+            assert gm.shape == (2, cfg.budget), gm.shape
+            assert set(np.unique(np.asarray(gm)).tolist()) <= {0.0, 1.0}, np.unique(gm)
+
+            # keep-weight == exactly the mask coming out of the (still-run) reduction
+            hid = model.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+            _, red_valid = model._hierarchical_reduce(hid, mask)
+            assert jnp.array_equal(gm.astype(bool), red_valid), (pool_budget, n_real)
+
+            # and that is strictly more than the trained cut would keep
+            _, base_m, _ = _forward(base, img, pos, state, time, mask,
+                                    train=False, rng=jax.random.key(1))
+            assert gm.sum() >= base_m.sum(), (pool_budget, n_real)
+            if n_real != 300:
+                assert (gm.sum(axis=1) > model.num_keep).all(), (pool_budget, n_real)
+
+        # train still does the Gumbel cut -- keep-weight is not the plain mask
+        _, wt, _ = _forward(model, img, pos, state, time, mask,
+                            train=True, rng=jax.random.key(2))
+        assert wt.shape == (2, cfg.budget)
+    print("OK eval_keep_all")
+
+
 def test_no_recompile():
     model, cfg = build(pool_budget=2048)
     traces = []
@@ -212,6 +251,7 @@ if __name__ == "__main__":
     test_round_math()
     test_reduction_deterministic()
     test_shapes_and_finite()
+    test_eval_keep_all()
     test_no_recompile()
     test_gradient_split()
     print("\nall hierarchical_selection checks passed")

@@ -68,6 +68,14 @@ class PerceptualMemory(nnx.Module):
             )
             self.keep_ratio = selector_cfg.get("keep_ratio", 0.5)
             self.num_keep = round(config.budget * self.keep_ratio)
+            # Inference-only ablation: skip the final trained cut and hand the
+            # backbone the whole post-reduction sequence (all `budget` tokens,
+            # unmasked). For a non-hierarchical selector (pool512) this means the
+            # raw `budget` pool passes straight through; for a hierarchical one
+            # (pool1024) the no-grad reduction rounds still run (pool_budget ->
+            # budget), only the last selector cut (budget -> num_keep) is
+            # dropped. Training is unchanged -- this only affects `train=False`.
+            self.eval_keep_all = selector_cfg.get("eval_keep_all", False)
 
         if self.is_hierarchical:
             assert self.use_selector, "hierarchical_selection requires perceptual_memory.selector.enabled"
@@ -180,6 +188,18 @@ class PerceptualMemory(nnx.Module):
             extra_stats["reduce_keep_frac"] = jax.lax.stop_gradient(
                 jnp.mean(real_after / jnp.clip(real_before, a_min=1.0))
             )
+
+        if self.eval_keep_all and not train:
+            # Ablation: skip the final trained cut entirely -- hand the backbone
+            # every valid post-reduction token at its trained slot (same
+            # in-place, full-length {0,1} convention as the real eval path
+            # below, just with nothing dropped). The selector is not even
+            # evaluated here.
+            mem_weight = valid_mask.astype(hidden_states.dtype)
+            return hidden_states, mem_weight, {
+                "keep_frac": masked_mean(mem_weight, valid_mask),
+                **extra_stats,
+            }
 
         logits = self.selector(hidden_states, valid_mask)
 

@@ -1,0 +1,56 @@
+budget: 512          # post-reduction sequence length (what the backbone pays for)
+pool_budget: 1024    # smallest hiersel pool: 1 no-grad reduction round (1024->512),
+                     # then the trained selector cut (512->256). ~1/8 the per-batch
+                     # host->device transfer of the 8192 pool. Cheapest point that
+                     # still exercises the hierarchical-reduction path (one bracket
+                     # round) beyond plain hard-select (perceptual-hiersel-modul_pool512).
+                     # Eval can't reapply --model.history_config_overrides, so pool
+                     # size lives in its own yaml.
+                     #
+                     # EVAL-ONLY VARIANT of perceptual-hiersel-modul_pool1024.yaml:
+                     # architecturally identical, adds selector.eval_keep_all. The
+                     # 1 no-grad reduction round (1024->512) still runs; only the
+                     # final trained cut (512->256) is skipped, so all 512 tokens
+                     # go to the backbone. Loads against base-yaml weights. Point
+                     # a local history_config.txt at this file to run the ablation.
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even  # how the pool_budget frames are drawn from the episode:
+                       #   even   -> evenly spaced (frame-rate reduction); deterministic, uniform coverage
+                       #   random -> uniform random subset (per-sample augmentation, stochastic at eval)
+  selector:
+    enabled: true
+    keep_ratio: 0.5 # final trained cut: `budget` -> round(budget * keep_ratio) at inference
+    # reduce_keep_ratio: 0.5  # per-round keep fraction for the no-grad reduction (defaults to keep_ratio)
+    depth: 2 # selector transformer depth -- kept small relative to the backbone
+    num_heads: 8
+    num_register_tokens: 4
+    # "lbfix2" weights (see perceptual-hardsel-modul.yaml): keep the router from collapsing.
+    ratio_loss_weight: 0.001
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 1e-4
+    eval_keep_all: true  # skip the final 512->256 cut at inference; all 512
+                         # post-reduction tokens go to the backbone
