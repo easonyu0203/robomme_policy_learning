@@ -1,0 +1,45 @@
+budget: 512          # post-reduction sequence length (what the backbone pays for)
+pool_budget: 2048    # 2 no-grad reduction rounds (2048->1024->512), then the trained
+                     # selector cut (512->256). Midpoint between pool1024 (1 round) and
+                     # pool4096 (3 rounds). ~1/4 the 8192 pool's per-batch host->device
+                     # transfer. Eval can't reapply --model.history_config_overrides, so
+                     # pool size lives in its own yaml.
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even  # how the pool_budget frames are drawn from the episode:
+                       #   even   -> evenly spaced (frame-rate reduction); deterministic, uniform coverage
+                       #   random -> uniform random subset (per-sample augmentation, stochastic at eval)
+  selector:
+    enabled: true
+    keep_ratio: 0.5 # final trained cut: `budget` -> round(budget * keep_ratio) at inference
+    # reduce_keep_ratio: 0.5  # per-round keep fraction for the no-grad reduction (defaults to keep_ratio)
+    depth: 2 # selector transformer depth -- kept small relative to the backbone
+    num_heads: 8
+    num_register_tokens: 4
+    # "lbfix2" weights (see perceptual-hardsel-modul.yaml): keep the router from collapsing.
+    ratio_loss_weight: 0.001
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 0.1     # SWEEP: 1000x default (1e-4); pairs the pool2048 reduction with the lb1e-1 selector setting. ratio stays at base 1e-3.
