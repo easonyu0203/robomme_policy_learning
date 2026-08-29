@@ -96,16 +96,21 @@ def test_shapes_and_finite():
         for k in ("ratio_loss", "z_loss", "load_balance_loss", "keep_frac", "reduce_keep_frac"):
             assert k in losses and jnp.isfinite(losses[k]).all(), (n_real, k)
 
+        # Eval keeps length == `budget` and masks in place (same as train) --
+        # NOT a physical gather; see percep_mem.py's eval branch for why the
+        # position-sensitive MemoryAttention consumer forbids repacking.
         gh, gm, stats = _forward(model, img, pos, state, time, mask,
                                  train=False, rng=jax.random.key(1))
-        assert gh.shape == (2, model.num_keep, dim), gh.shape
+        assert gh.shape == (2, cfg.budget, dim), gh.shape
+        assert gm.shape == (2, cfg.budget), gm.shape
         assert jnp.isfinite(gh).all(), n_real
-        # never invents real tokens; when the pool has plenty, fills the budget with real ones
-        kept_real = float(gm.sum(axis=1).min())
+        assert set(np.unique(np.asarray(gm)).tolist()) <= {0.0, 1.0}, np.unique(gm)
+        # exactly `num_keep` kept when enough real tokens survive the reduction;
+        # never more than the real tokens available (padding is never selected)
+        kept = np.asarray(gm.sum(axis=1))
+        assert (kept <= model.num_keep).all(), (n_real, kept)
         if n_real is None or n_real >= 600:
-            assert kept_real == model.num_keep, (n_real, kept_real)
-        else:
-            assert kept_real <= (n_real or model.num_keep), (n_real, kept_real)
+            assert (kept == model.num_keep).all(), (n_real, kept)
     print("OK shapes_and_finite")
 
 

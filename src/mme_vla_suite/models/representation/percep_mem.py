@@ -9,6 +9,7 @@ from mme_vla_suite.models.representation.selector import (
     Selector,
     batch_gather,
     gumbel_softmax_hard,
+    masked_mean,
     select_topk,
     selector_losses,
 )
@@ -193,14 +194,26 @@ class PerceptualMemory(nnx.Module):
             losses = selector_losses(logits, decision, valid_mask, self.keep_ratio)
             return hidden_states, mem_weight, {**losses, **extra_stats}
 
-        # Eval: deterministic top-k by keep margin, physically gathered --
-        # the only place the sequence actually shortens (the real
-        # inference-time compute saving).
+        # Eval: deterministic top-`num_keep`-by-keep-margin, returned as a hard
+        # {0,1} keep-weight over the *full* `budget`-length sequence -- NOT a
+        # physical gather. The downstream consumer (history_gemma.MemoryAttention)
+        # applies RoPE keyed to each memory token's slot index and a query offset
+        # of `mem_len`, so it is *not* permutation- or length-invariant. Gathering
+        # would repack the survivors into slots 0..num_keep-1 in descending-margin
+        # order (jax.lax.top_k is value-sorted, not index-sorted), handing every
+        # token a RoPE position unrelated to the temporal slot it was trained at,
+        # and shrinking the query offset from `budget` to `num_keep`. Training
+        # masks in place and keeps length == `budget`; eval must do the same or
+        # the cross-attention sees a positional geometry it never saw in training
+        # (train loss fine, eval collapses). Keeping length == `budget` with the
+        # masked softmax leaves the Gumbel-sample-vs-argmax difference as the only
+        # train/eval gap -- the intended one.
         topk_idx = select_topk(logits, valid_mask, self.num_keep)
-        gathered_states = batch_gather(hidden_states, topk_idx)
-        gathered_mask = batch_gather(valid_mask, topk_idx).astype(hidden_states.dtype)
+        b_idx = jnp.arange(valid_mask.shape[0])[:, None]
+        keep_mask = jnp.zeros_like(valid_mask).at[b_idx, topk_idx].set(True) & valid_mask
+        mem_weight = keep_mask.astype(hidden_states.dtype)
         stats = {
-            "keep_frac": jnp.asarray(self.num_keep / self.config.budget, dtype=hidden_states.dtype),
+            "keep_frac": masked_mean(mem_weight, valid_mask),
             **extra_stats,
         }
-        return gathered_states, gathered_mask, stats
+        return hidden_states, mem_weight, stats
