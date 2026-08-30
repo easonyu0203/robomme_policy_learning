@@ -1,0 +1,50 @@
+budget: 512          # post-reduction sequence length (what the backbone pays for)
+pool_budget: 1024    # 1 no-grad reduction round (1024->512), then the trained
+                     # selector cut (512->256).
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even  # how the pool_budget frames are drawn from the episode:
+                       #   even   -> evenly spaced (frame-rate reduction); deterministic, uniform coverage
+                       #   random -> uniform random subset (per-sample augmentation, stochastic at eval)
+  selector:
+    enabled: true
+    keep_ratio: 0.5 # final trained cut: `budget` -> round(budget * keep_ratio) at inference
+    # reduce_keep_ratio: 0.5  # per-round keep fraction for the no-grad reduction (defaults to keep_ratio)
+    depth: 2 # selector transformer depth -- kept small relative to the backbone
+    num_heads: 8
+    num_register_tokens: 4
+    # Multi-level pick: during training feed the final trained cut a uniformly-random
+    # reduction-tree node's input (2*(pool_budget/512)-1 = 3 nodes for pool1024: 2 leaf
+    # chunks + root), not always the root's. Trains the shared selector + pi0.5 on every
+    # reduction depth. Eval is unchanged (always the root).
+    # See models/representation/percep_mem.py::_tree_pick_input.
+    multilevel: true
+    # "lbfix2" weights (see perceptual-hardsel-modul.yaml): keep the router from collapsing.
+    ratio_loss_weight: 0.001
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 0.1     # matches perceptual-hiersel-modul_pool1024_lb1e-1.yaml. NOTE: the per-slot
+                                      # load-balance statistic mixes reduction depths under multilevel -- sweep or
+                                      # drop if the selector still collapses.
