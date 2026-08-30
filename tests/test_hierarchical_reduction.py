@@ -247,6 +247,149 @@ def test_reduction_deterministic():
     print("OK reduction_deterministic")
 
 
+# ---------------------------------------------------------------------------
+# multilevel pick (perceptual_memory.selector.multilevel): during training the
+# final trained cut is fed a uniformly-random reduction-tree node's input, not
+# always the root's. Nodes are numbered round-major -- one per reduce_chunk_size
+# chunk of every round's input, then the root == n_nodes - 1.
+# ---------------------------------------------------------------------------
+
+ML = {"perceptual_memory.selector.multilevel": True}
+
+
+def test_multilevel_node_math():
+    # n_nodes = sum(chunks per round) + 1 (root) = 2 * (pool_budget / 512) - 1
+    for pool_budget, want in ((512, 1), (1024, 3), (2048, 7), (4096, 15), (8192, 31)):
+        model, _ = build(pool_budget=pool_budget, **ML)
+        assert model.multilevel and model.n_nodes == want, (pool_budget, model.n_nodes)
+    print("OK multilevel_node_math")
+
+
+def test_multilevel_root_matches_baseline():
+    # picking the root for every sample must be bit-identical to the plain
+    # no-grad cascade -- i.e. the eval path is unchanged.
+    model, cfg = build(pool_budget=2048, **ML)
+    for n_real in (700, 1500, None):
+        img, pos, state, time, mask = rand_inputs(cfg, n_real=n_real, seed=n_real or 0)
+        hid = model.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+        root = jnp.full((img.shape[0],), model.n_nodes - 1, dtype=jnp.int32)
+        h_tree, v_tree = model._tree_pick_input(hid, mask, root)
+        h_ref, v_ref = model._hierarchical_reduce(hid, mask)
+        assert jnp.array_equal(h_tree, h_ref) and jnp.array_equal(v_tree, v_ref), n_real
+    print("OK multilevel_root_matches_baseline")
+
+
+def test_multilevel_pick_slices():
+    model, cfg = build(pool_budget=2048, **ML)  # 7 nodes: 0-3 leaves, 4-5 round2, 6 root
+    img, pos, state, time, mask = rand_inputs(cfg, b=7, n_real=1400, seed=7)
+    hid = model.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+    r1_h, r1_v = model._reduce_one_round(hid, mask)          # (7, 1024, d)
+    r2_h, r2_v = model._reduce_one_round(r1_h, r1_v)         # (7, 512, d) == root input
+    node_input = [
+        (hid[:, 0:512],     mask[:, 0:512]),       # 0
+        (hid[:, 512:1024],  mask[:, 512:1024]),    # 1
+        (hid[:, 1024:1536], mask[:, 1024:1536]),   # 2
+        (hid[:, 1536:2048], mask[:, 1536:2048]),   # 3
+        (r1_h[:, 0:512],    r1_v[:, 0:512]),       # 4
+        (r1_h[:, 512:1024], r1_v[:, 512:1024]),    # 5
+        (r2_h,              r2_v),                 # 6 (root)
+    ]
+    # whole batch on one node
+    for node, (want_h, want_v) in enumerate(node_input):
+        picked = jnp.full((7,), node, dtype=jnp.int32)
+        got_h, got_v = model._tree_pick_input(hid, mask, picked)
+        assert jnp.array_equal(got_h, want_h) and jnp.array_equal(got_v, want_v), node
+    # per-sample: row i picks node i
+    got_h, got_v = model._tree_pick_input(hid, mask, jnp.arange(7, dtype=jnp.int32))
+    for i in range(7):
+        assert jnp.array_equal(got_h[i], node_input[i][0][i]), i
+        assert jnp.array_equal(got_v[i], node_input[i][1][i]), i
+    print("OK multilevel_pick_slices")
+
+
+def test_multilevel_static_shape():
+    model, cfg = build(pool_budget=2048, **ML)
+    dim = cfg.memory_token_dim
+    traces = []
+
+    @nnx.jit
+    def pick(model, hid, mask, picked):
+        traces.append(1)  # once per trace, not per call
+        return model._tree_pick_input(hid, mask, picked)
+
+    img, pos, state, time, mask = rand_inputs(cfg, b=4, n_real=800, seed=1)
+    hid = model.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+    for picked in (
+        jnp.zeros(4, jnp.int32),
+        jnp.full((4,), model.n_nodes - 1, jnp.int32),
+        jnp.array([0, 2, 4, 6], jnp.int32),
+    ):
+        h, v = pick(model, hid, mask, picked)
+        assert h.shape == (4, 512, dim) and v.shape == (4, 512)
+        assert jnp.isfinite(h).all()
+    assert len(traces) == 1, f"retraced {len(traces)}x -- a dynamic shape leaked"
+    print("OK multilevel_static_shape")
+
+
+def test_multilevel_gradient_routing():
+    model, cfg = build(pool_budget=2048, **ML)
+    img, pos, state, time, mask = rand_inputs(cfg, b=4, n_real=1400, seed=3)
+    rng = jax.random.key(4)
+
+    def grads_for(picked_node):
+        picked = jnp.full((4,), picked_node, dtype=jnp.int32)
+
+        def loss_fn(m):
+            hid = m.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+            ph, pv = m._tree_pick_input(hid, mask, picked)
+            dec = gumbel_softmax_hard(m.selector(ph, pv), rng)[..., 0]
+            return ph.mean() + dec.mean()
+
+        g = nnx.grad(loss_fn)(model)
+        return optax.global_norm(g.feature_encoder), optax.global_norm(g.selector)
+
+    # leaf pick (node 0): the trained cut runs on hid[:, :512]; the no-grad
+    # rounds run but leak no gradient -> identical to a standalone cut on that
+    # slice with no tree at all.
+    fe0, sel0 = grads_for(0)
+    assert fe0 > 1e-6 and sel0 > 1e-6, (fe0, sel0)
+
+    def loss_ref(m):
+        hid = m.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+        dec = gumbel_softmax_hard(m.selector(hid[:, :512], mask[:, :512]), rng)[..., 0]
+        return hid[:, :512].mean() + dec.mean()
+
+    g_ref = nnx.grad(loss_ref)(model)
+    assert jnp.allclose(fe0, optax.global_norm(g_ref.feature_encoder), rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(sel0, optax.global_norm(g_ref.selector), rtol=1e-4, atol=1e-5)
+
+    # root pick still trains both (via the differentiable survivor gather).
+    fe_root, sel_root = grads_for(model.n_nodes - 1)
+    assert fe_root > 1e-6 and sel_root > 1e-6, (fe_root, sel_root)
+    print(f"OK multilevel_gradient_routing  (leaf |g_fe|={fe0:.4g} |g_sel|={sel0:.4g})")
+
+
+def test_multilevel_call_path():
+    ml, cfg = build(pool_budget=2048, **ML)
+    base, _ = build(pool_budget=2048)  # same arch + seed, multilevel off
+    dim = cfg.memory_token_dim
+    img, pos, state, time, mask = rand_inputs(cfg, n_real=1400, seed=11)
+
+    h, w, losses = _forward(ml, img, pos, state, time, mask,
+                            train=True, rng=jax.random.key(1))
+    assert h.shape == (2, cfg.budget, dim) and w.shape == (2, cfg.budget)
+    assert jnp.isfinite(h).all() and jnp.isfinite(w).all()
+    assert "picked_node" in losses and jnp.isfinite(losses["picked_node"])
+    for k in ("ratio_loss", "z_loss", "load_balance_loss", "keep_frac", "reduce_keep_frac"):
+        assert k in losses, k
+
+    # eval ignores multilevel -> identical to the non-multilevel model
+    he, we, _ = _forward(ml, img, pos, state, time, mask, train=False, rng=jax.random.key(1))
+    hb, wb, _ = _forward(base, img, pos, state, time, mask, train=False, rng=jax.random.key(1))
+    assert jnp.array_equal(he, hb) and jnp.array_equal(we, wb)
+    print("OK multilevel_call_path")
+
+
 if __name__ == "__main__":
     test_round_math()
     test_reduction_deterministic()
@@ -254,4 +397,10 @@ if __name__ == "__main__":
     test_eval_keep_all()
     test_no_recompile()
     test_gradient_split()
+    test_multilevel_node_math()
+    test_multilevel_root_matches_baseline()
+    test_multilevel_pick_slices()
+    test_multilevel_static_shape()
+    test_multilevel_gradient_routing()
+    test_multilevel_call_path()
     print("\nall hierarchical_selection checks passed")
