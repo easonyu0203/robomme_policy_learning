@@ -19,6 +19,7 @@ from mme_vla_suite.models.representation.percep_mem import PerceptualMemory
 from mme_vla_suite.models.representation.selector import batch_gather
 from mme_vla_suite.models.representation.selector import gumbel_softmax_hard
 from mme_vla_suite.models.representation.selector import select_topk
+from mme_vla_suite.models.representation.selector import Selector
 
 CFG_PATH = "src/mme_vla_suite/models/config/robomme/perceptual-hiersel-modul.yaml"
 
@@ -478,6 +479,139 @@ def test_tree_nodes_preserve_time_order():
     print("OK tree_nodes_preserve_time_order")
 
 
+# ---------------------------------------------------------------------------
+# selector.ema_reducer: the no-grad reduction rounds score with an external
+# (EMA-shadow) selector passed as `reducer_selector`, not the live `self.selector`.
+# The final trained cut is unchanged -- always `self.selector`. `reducer_selector`
+# gets no gradient (its output is stop_gradient'd, and train_step never puts it in
+# argnums). Eval passes nothing -> `self.selector` (which is itself EMA at eval).
+# ---------------------------------------------------------------------------
+
+
+def _twin_selector(cfg, seed):
+    """A structurally identical Selector with independent (different) weights --
+    stands in for the EMA-shadow selector `scripts/train.py` builds from
+    `state.ema_params`."""
+    sc = cfg.perceptual_memory.selector
+    return Selector(
+        dim=cfg.memory_token_dim,
+        depth=sc.get("depth", 2),
+        num_heads=sc.get("num_heads", 8),
+        num_register_tokens=sc.get("num_register_tokens", 4),
+        rngs=nnx.Rngs(seed),
+        dtype=jnp.float32,
+    )
+
+
+@nnx.jit(static_argnames=("train",))
+def _forward_red(model, img, pos, state, time, mask, reducer_selector, *, train, rng):
+    return model(
+        img, pos, state, time, mask, train=train, rng=rng, reducer_selector=reducer_selector
+    )
+
+
+def test_ema_reducer_scoring_uses_the_passed_selector():
+    for pool_budget, budget, ml in ((1024, 512, False), (2048, 512, True), (128, 64, True)):
+        ov = {"budget": budget, **(ML if ml else {})}
+        model, cfg = build(pool_budget=pool_budget, **ov)
+        img, pos, state, time, mask = rand_inputs(cfg, n_real=None, seed=pool_budget)
+        hid = model.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+
+        # force the root pick so every sample runs the full cascade (multilevel
+        # leaf picks slice raw `hidden` and don't touch the scorer at all).
+        if ml:
+            root = jnp.full((img.shape[0],), model.n_nodes - 1, jnp.int32)
+            reduce = lambda s: model._tree_pick_input(hid, mask, root, s)
+        else:
+            reduce = lambda s: model._hierarchical_reduce(hid, mask, s)
+
+        # (a) scorer=None resolves to the live self.selector -> identical to
+        #     passing it explicitly (guards the `is not None else self.selector`).
+        a_none, v_none = reduce(None)
+        a_live, v_live = reduce(model.selector)
+        assert jnp.array_equal(a_none, a_live) and jnp.array_equal(v_none, v_live), pool_budget
+
+        # (b) a structurally identical selector with different weights -> different
+        #     survivors reach the cut.
+        a_twin, _ = reduce(_twin_selector(cfg, seed=pool_budget + 1))
+        assert not jnp.allclose(a_none, a_twin), (pool_budget, "reducer_selector had no effect")
+
+        # (c) end-to-end through __call__ (non-multilevel: deterministic cascade).
+        if not ml:
+            h0, _, _ = _forward_red(model, img, pos, state, time, mask, None,
+                                    train=True, rng=jax.random.key(0))
+            h1, _, _ = _forward_red(model, img, pos, state, time, mask,
+                                    _twin_selector(cfg, seed=pool_budget + 2),
+                                    train=True, rng=jax.random.key(0))
+            assert h0.shape == (img.shape[0], budget, cfg.memory_token_dim)
+            assert not jnp.allclose(h0, h1), pool_budget
+    print("OK ema_reducer_scoring_uses_the_passed_selector")
+
+
+def test_ema_reducer_final_cut_still_uses_live_selector():
+    # With reducer_selector fixed, mutating ONLY the live selector's head must
+    # still move the final cut (it scores the cut); the reduction (twin) is held.
+    model, cfg = build(pool_budget=1024)
+    img, pos, state, time, mask = rand_inputs(cfg, n_real=700, seed=3)
+    twin = _twin_selector(cfg, seed=99)
+    rng = jax.random.key(1)
+
+    _, w0, _ = _forward_red(model, img, pos, state, time, mask, twin, train=True, rng=rng)
+    # Perturb ONLY the live selector's head keep-channel bias -> shifts the
+    # keep/drop *margin* (not an equal shift that would cancel), so the final
+    # cut's decision changes. Reaches `w` only via the final cut; the reduction
+    # uses `twin`, untouched.
+    head = model.selector.head
+    head.bias = nnx.Param(head.bias.value.at[0].add(12.0))
+    _, w1, _ = _forward_red(model, img, pos, state, time, mask, twin, train=True, rng=rng)
+    assert not jnp.allclose(w0, w1), "final cut ignored the live selector"
+    print("OK ema_reducer_final_cut_still_uses_live_selector")
+
+
+def test_ema_reducer_no_recompile_and_static_shape():
+    model, cfg = build(pool_budget=2048, **ML)
+    twin = _twin_selector(cfg, seed=7)
+    dim = cfg.memory_token_dim
+    traces = []
+
+    @nnx.jit(static_argnames=("train",))
+    def f(model, img, pos, state, time, mask, reducer_selector, *, train, rng):
+        traces.append(1)
+        return model(img, pos, state, time, mask, train=train, rng=rng,
+                     reducer_selector=reducer_selector)
+
+    a = rand_inputs(cfg, n_real=800, seed=1)
+    b = rand_inputs(cfg, n_real=1900, seed=2)
+    o1 = f(model, *a, twin, train=True, rng=jax.random.key(0))[0]
+    o2 = f(model, *b, twin, train=True, rng=jax.random.key(0))[0]
+    assert o1.shape == (2, cfg.budget, dim) == o2.shape
+    assert len(traces) == 1, f"retraced {len(traces)}x with reducer_selector"
+    print("OK ema_reducer_no_recompile_and_static_shape")
+
+
+def test_ema_reducer_gradient_routing():
+    # reducer_selector is NOT in argnums and its output is stop_gradient'd, so
+    # nnx.grad(model) still trains feature_encoder (via the survivor gather) and
+    # the live selector (via the final cut) exactly as without it.
+    model, cfg = build(pool_budget=2048, **ML)
+    twin = _twin_selector(cfg, seed=5)
+    img, pos, state, time, mask = rand_inputs(cfg, b=4, n_real=1400, seed=3)
+    rng = jax.random.key(4)
+
+    def loss_fn(m, scorer):
+        h, w, _ = m(img, pos, state, time, mask, train=True, rng=rng, reducer_selector=scorer)
+        return h.mean() + w.mean()
+
+    # scorer is arg 1 -> non-differentiated module arg (same as scripts/train.py).
+    g_twin = nnx.grad(loss_fn, argnums=0)(model, twin)
+    g_none = nnx.grad(loss_fn, argnums=0)(model, None)
+    for tag, g in (("twin", g_twin), ("none", g_none)):
+        assert optax.global_norm(g.feature_encoder) > 1e-6, tag
+        assert optax.global_norm(g.selector) > 1e-6, tag
+    assert twin is not model.selector
+    print("OK ema_reducer_gradient_routing")
+
+
 if __name__ == "__main__":
     test_round_math()
     test_reduction_deterministic()
@@ -494,4 +628,8 @@ if __name__ == "__main__":
     test_reduce_round_preserves_time_order()
     test_hierarchical_reduce_preserves_time_order()
     test_tree_nodes_preserve_time_order()
+    test_ema_reducer_scoring_uses_the_passed_selector()
+    test_ema_reducer_final_cut_still_uses_live_selector()
+    test_ema_reducer_no_recompile_and_static_shape()
+    test_ema_reducer_gradient_routing()
     print("\nall hierarchical_selection checks passed")

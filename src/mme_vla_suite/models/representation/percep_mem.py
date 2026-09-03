@@ -138,7 +138,10 @@ class PerceptualMemory(nnx.Module):
                 )
 
     def _reduce_one_round(
-        self, hidden: at.Float[at.Array, "b l d"], valid: at.Bool[at.Array, "b l"]
+        self,
+        hidden: at.Float[at.Array, "b l d"],
+        valid: at.Bool[at.Array, "b l"],
+        scorer: Selector | None = None,
     ) -> tuple[at.Float[at.Array, "b lr d"], at.Bool[at.Array, "b lr"]]:
         """One no-grad reduction round (caltech hard_vit.py::_select_chunks):
         split the sequence into contiguous `reduce_chunk_size` chunks (folded
@@ -147,6 +150,14 @@ class PerceptualMemory(nnx.Module):
         -- this stage is preprocessing -- but the survivor gather stays
         differentiable, so the FeatureEncoder still learns from whichever tokens
         reach the trained cut.
+
+        `scorer` is the module that produces the keep/drop logits. Defaults to
+        the live `self.selector`; with `selector.ema_reducer` the training
+        forward passes the EMA-shadow selector instead (see
+        `PerceptualMemory.__call__`), so the reduction tree's per-node input
+        distributions stop drifting step-to-step as the live selector trains --
+        a stationary target for the trained final cut / pi0.5. The final cut
+        itself always uses the live `self.selector`.
 
         Survivors are re-sorted into ascending position (== ascending time; see
         the `jnp.sort` below) so the reduced sequence stays temporally ordered
@@ -168,7 +179,9 @@ class PerceptualMemory(nnx.Module):
         hc = hidden.reshape(b * n_chunks, chunk, dim)
         vc = valid.reshape(b * n_chunks, chunk)
         # Scoring: no gradient to the selector params or to `hc` via this path.
-        logits = jax.lax.stop_gradient(self.selector(hc, vc))
+        logits = jax.lax.stop_gradient(
+            (scorer if scorer is not None else self.selector)(hc, vc)
+        )
         idx = select_topk(logits, vc, keep)  # (b*n_chunks, keep) int, margin-sorted
         # Re-sort the survivor indices into ascending position before gathering,
         # so the reduced sequence stays in temporal order. Within a chunk the pool
@@ -190,16 +203,19 @@ class PerceptualMemory(nnx.Module):
         return hc.reshape(b, n_chunks * keep, dim), vc.reshape(b, n_chunks * keep)
 
     def _hierarchical_reduce(
-        self, hidden: at.Float[at.Array, "b l d"], valid: at.Bool[at.Array, "b l"]
+        self,
+        hidden: at.Float[at.Array, "b l d"],
+        valid: at.Bool[at.Array, "b l"],
+        scorer: Selector | None = None,
     ) -> tuple[at.Float[at.Array, "b lr d"], at.Bool[at.Array, "b lr"]]:
         """caltech hard_vit.py::_hierarchical_reduce: repeatedly `_reduce_one_round`
         until `pool_budget` -> `reduced_len` (<= `budget`). `self.n_reduce_rounds`
         is static, so this loop unrolls at trace time (no dynamic shapes, no
         lax.while_loop). This is the eval path and the non-multilevel train path;
-        `_tree_pick_input` is the multilevel train path.
+        `_tree_pick_input` is the multilevel train path. `scorer` -> `_reduce_one_round`.
         """
         for _ in range(self.n_reduce_rounds):
-            hidden, valid = self._reduce_one_round(hidden, valid)
+            hidden, valid = self._reduce_one_round(hidden, valid, scorer)
         return hidden, valid
 
     def _tree_pick_input(
@@ -207,6 +223,7 @@ class PerceptualMemory(nnx.Module):
         hidden: at.Float[at.Array, "b l d"],
         valid: at.Bool[at.Array, "b l"],
         picked_node: at.Int[at.Array, " b"],
+        scorer: Selector | None = None,
     ) -> tuple[at.Float[at.Array, "b bud d"], at.Bool[at.Array, "b bud"]]:
         """Per sample, return the `reduce_chunk_size`-wide (tokens, valid) input
         of the picked reduction-tree node. Nodes are numbered round-major:
@@ -236,7 +253,7 @@ class PerceptualMemory(nnx.Module):
                 picked_h = jnp.where(sel[:, :, None], cur_h[:, sl, :], picked_h)
                 picked_v = jnp.where(sel, cur_v[:, sl], picked_v)
                 node += 1
-            cur_h, cur_v = self._reduce_one_round(cur_h, cur_v)
+            cur_h, cur_v = self._reduce_one_round(cur_h, cur_v, scorer)
         # root: cur_h is (b, reduced_len == chunk, d) after the last round
         sel = (picked_node == node)[:, None]
         picked_h = jnp.where(sel[:, :, None], cur_h, picked_h)
@@ -253,9 +270,19 @@ class PerceptualMemory(nnx.Module):
         *,
         train: bool = False,
         rng: at.KeyArrayLike | None = None,
+        reducer_selector: Selector | None = None,
     ):
         # get memory tokens using feature encoder
         assert static_image_emb.shape[1] == self.input_len
+
+        # `reducer_selector`: when set (training forward, `selector.ema_reducer`),
+        # the no-grad hierarchical-reduction rounds score with this EMA-shadow
+        # selector instead of the live `self.selector`, so their per-node input
+        # distributions don't chase the live selector as it trains. The final
+        # trained cut below is unaffected -- always the live `self.selector`.
+        # eval passes nothing here; there `self.selector` is itself the EMA
+        # snapshot (checkpoints store `ema_params` under `params/`), so the
+        # reduction stays consistent with the last training window.
 
         hidden_states = self.feature_encoder.encode_perceptual_memory(
             static_image_emb, static_pos_emb, static_state_emb, static_time_emb
@@ -286,7 +313,7 @@ class PerceptualMemory(nnx.Module):
                     rng_pick, (hidden_states.shape[0],), 0, self.n_nodes
                 )
                 hidden_states, valid_mask = self._tree_pick_input(
-                    hidden_states, valid_mask, picked_node
+                    hidden_states, valid_mask, picked_node, reducer_selector
                 )
                 extra_stats["picked_node"] = jax.lax.stop_gradient(
                     picked_node.astype(jnp.float32).mean()
@@ -295,7 +322,7 @@ class PerceptualMemory(nnx.Module):
                 # Eval, and non-multilevel training: full cascade to the root
                 # ("train it only at the last reduction layer").
                 hidden_states, valid_mask = self._hierarchical_reduce(
-                    hidden_states, valid_mask
+                    hidden_states, valid_mask, reducer_selector
                 )
             real_after = valid_mask.sum(axis=1)
             # Fraction of real (non-padding) tokens that survived the reduction --

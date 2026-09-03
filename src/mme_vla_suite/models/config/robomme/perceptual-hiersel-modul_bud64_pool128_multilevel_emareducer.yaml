@@ -1,0 +1,53 @@
+budget: 64           # post-reduction sequence length (what the backbone pays for)
+pool_budget: 128     # 1 no-grad reduction round (128->64), then the trained
+                     # selector cut (64->32). = perceptual-hiersel-modul_bud64_pool128_multilevel
+                     # + selector.ema_reducer (see below). Eval can't reapply
+                     # --model.history_config_overrides, so this lives in its own yaml.
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even  # evenly-spaced frame-rate reduction; deterministic, uniform coverage
+  selector:
+    enabled: true
+    keep_ratio: 0.5 # final trained cut: `budget` -> round(budget * keep_ratio) at inference (64 -> 32)
+    # reduce_keep_ratio: 0.5  # per-round keep fraction for the no-grad reduction (defaults to keep_ratio)
+    depth: 2 # selector transformer depth -- kept small relative to the backbone
+    num_heads: 8
+    num_register_tokens: 4
+    multilevel: true
+    # Stabilise the reduction tree: the no-grad rounds score with the EMA-shadow
+    # selector (slice of the training EMA at decay `ema_decay`) instead of the
+    # live selector, so each reduction node's input distribution stops chasing
+    # the selector as it trains -- a stationary target for the final trained cut
+    # + pi0.5's memory-attention. The final cut still uses the live selector.
+    # Eval is unchanged: checkpoints store `ema_params` under `params/`, so the
+    # loaded selector is already the EMA snapshot. See percep_mem.py, scripts/train.py.
+    ema_reducer: true
+    # "lbfix2" weights (see perceptual-hardsel-modul.yaml): keep the router from collapsing.
+    ratio_loss_weight: 0.001
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 0.1     # matches the pool*_multilevel lineage. NOTE: the per-slot
+                                      # load-balance statistic mixes reduction depths under multilevel
+                                      # -- sweep or drop if the selector still collapses.

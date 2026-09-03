@@ -211,6 +211,7 @@ def init_train_state(
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
+    use_ema_reducer: bool,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[HistAugObservation, _model.Actions],
@@ -220,24 +221,38 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    # `selector.ema_reducer`: score the hierarchical-reduction rounds with the
+    # EMA-shadow selector (a stationary target) instead of the live one, which
+    # keeps chasing itself as it trains. The live selector still does the final
+    # trained cut. Merge is trace-time only (train_step is jitted); leaves are
+    # the existing `ema_params` buffers, no copy. See percep_mem.py.
+    reducer_selector = None
+    if use_ema_reducer and state.ema_params is not None:
+        reducer_selector = nnx.merge(state.model_def, state.ema_params).mem_encoder.selector
+
     @at.typecheck
     def loss_fn(
         model: _model.HistoryPi0,
         rng: at.KeyArrayLike,
         observation: HistAugObservation,
         actions: _model.Actions,
+        reducer_sel: Any,
     ):
-        chunked_loss, stats = model.compute_loss(rng, observation, actions, train=True)
+        chunked_loss, stats = model.compute_loss(
+            rng, observation, actions, train=True, reducer_selector=reducer_sel
+        )
         return jnp.mean(chunked_loss), stats
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
-    # Filter out frozen params.
+    # Filter out frozen params. `reducer_selector` is a non-differentiated arg
+    # (not in argnums; its scoring output is stop_gradient'd) -- the EMA-shadow
+    # selector threaded to the reduction rounds, not trained.
     diff_state = nnx.DiffState(0, config.trainable_filter)
     (loss, stats), grads = nnx.value_and_grad(
         loss_fn, argnums=diff_state, has_aux=True
-    )(model, train_rng, observation, actions)
+    )(model, train_rng, observation, actions, reducer_selector)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -368,6 +383,25 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
         else:
             raise ValueError(f"Unsupported streaming_obs_horizon: {history_config.streaming_obs_horizon}")
 
+    # `perceptual_memory.selector.ema_reducer`: during training, score the
+    # hierarchical-reduction rounds with the EMA-shadow selector instead of the
+    # live one (stationary target for the trained cut / pi0.5). Resolved here
+    # from the loaded yaml and baked into the jitted train_step.
+    use_ema_reducer = False
+    if history_config is not None and history_config.get("representation_type") == "perceptual":
+        pm = history_config.get("perceptual_memory", {}) or {}
+        selector_cfg = pm.get("selector", {}) or {}
+        use_ema_reducer = bool(
+            pm.get("type") == "hierarchical_selection"
+            and selector_cfg.get("ema_reducer", False)
+        )
+        if use_ema_reducer and config.ema_decay is None:
+            raise ValueError(
+                "selector.ema_reducer needs ema_decay set (the reduction scores "
+                "with the EMA-shadow selector)."
+            )
+    logging.info(f"selector.ema_reducer: {use_ema_reducer}")
+
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
@@ -410,7 +444,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     )
 
     ptrain_step = jax.jit(
-        functools.partial(train_step, config),
+        functools.partial(train_step, config, use_ema_reducer),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding, replicated_sharding),
         donate_argnums=(1,),

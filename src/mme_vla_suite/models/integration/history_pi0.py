@@ -416,7 +416,12 @@ class HistoryPi0(BaseModel):
 
     @at.typecheck
     def embed_memory(
-        self, obs: HistAugObservation, *, train: bool = False, rng: at.KeyArrayLike | None = None
+        self,
+        obs: HistAugObservation,
+        *,
+        train: bool = False,
+        rng: at.KeyArrayLike | None = None,
+        reducer_selector: Any = None,
     ):
         if self.representation_type == "perceptual":
             tokens, mem_mask, stats = self.mem_encoder(
@@ -427,6 +432,7 @@ class HistoryPi0(BaseModel):
                 obs.static_mask,
                 train=train,
                 rng=rng,
+                reducer_selector=reducer_selector,
             )
             # `mem_mask` is None (selector disabled -- every mode but the new
             # hard-selection one) or a continuous [0,1] keep-weight (selector
@@ -600,6 +606,7 @@ class HistoryPi0(BaseModel):
         actions: Actions,
         *,
         train: bool = False,
+        reducer_selector: Any = None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng, selector_rng = jax.random.split(rng, 4)
         observation = preprocess_observation(preprocess_rng, observation, train=train)
@@ -654,7 +661,7 @@ class HistoryPi0(BaseModel):
             )
         elif self.integration_type == "modulation":
             mem_seq, mem_mask, _, _, stats = self.embed_memory(
-                observation, train=train, rng=selector_rng
+                observation, train=train, rng=selector_rng, reducer_selector=reducer_selector
             )
             mem_mask = mem_mask.astype(jnp.float32) if mem_mask is not None else None
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
