@@ -148,6 +148,10 @@ class PerceptualMemory(nnx.Module):
         differentiable, so the FeatureEncoder still learns from whichever tokens
         reach the trained cut.
 
+        Survivors are re-sorted into ascending position (== ascending time; see
+        the `jnp.sort` below) so the reduced sequence stays temporally ordered
+        for the slot-keyed key RoPE in history_gemma.MemoryAttention.
+
         An all-padding chunk (short episode) produces NaN scores from the
         all-masked attention, but `select_topk` maps its -inf margins to
         arbitrary indices whose gathered tokens carry `valid=False`; the NaN
@@ -165,7 +169,21 @@ class PerceptualMemory(nnx.Module):
         vc = valid.reshape(b * n_chunks, chunk)
         # Scoring: no gradient to the selector params or to `hc` via this path.
         logits = jax.lax.stop_gradient(self.selector(hc, vc))
-        idx = select_topk(logits, vc, keep)  # (b*n_chunks, keep) int
+        idx = select_topk(logits, vc, keep)  # (b*n_chunks, keep) int, margin-sorted
+        # Re-sort the survivor indices into ascending position before gathering,
+        # so the reduced sequence stays in temporal order. Within a chunk the pool
+        # is contiguous and time-sorted and real tokens are left-packed (right
+        # padding), so ascending index == ascending time with padding last; each
+        # round's chunks span disjoint, ordered time spans, so the property holds
+        # recursively -- `_hierarchical_reduce`'s root (eval) and every
+        # `_tree_pick_input` node (multilevel train) then hand
+        # history_gemma.MemoryAttention a time-ordered sequence. Leaving the
+        # keep-margin order instead decorrelates the array slot from time and
+        # breaks that module's slot-keyed key RoPE (the failure class d738e40
+        # fixed for the final cut, reintroduced one level up), and is
+        # content-dependent + non-stationary -- the memory reshuffles step to step
+        # as scores cross even when the scene barely moves.
+        idx = jnp.sort(idx, axis=-1)
         # Gather: differentiable w.r.t. `hidden` for the surviving tokens.
         hc = batch_gather(hc, idx)
         vc = batch_gather(vc[..., None], idx)[..., 0]

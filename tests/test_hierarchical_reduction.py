@@ -191,7 +191,7 @@ def _reduce_variant(model, hidden, valid, mode):
         sc = model.selector(hc, vc)
         if mode != "none":
             sc = jax.lax.stop_gradient(sc)
-        idx = select_topk(sc, vc, keep)
+        idx = jnp.sort(select_topk(sc, vc, keep), axis=-1)  # mirror: temporal re-sort
         hc = batch_gather(hc, idx)
         vc = batch_gather(vc[..., None], idx)[..., 0]
         n = nc * keep
@@ -370,6 +370,13 @@ def test_multilevel_gradient_routing():
 
 
 def test_multilevel_call_path():
+    # Eval is byte-identical to the non-multilevel model (multilevel is a pure
+    # train-time augmentation). Necessary but NOT sufficient: the property that
+    # actually keeps hierarchical selection from collapsing is that every tree
+    # node -- and the eval root -- stays temporally ordered, so the slot-keyed
+    # RoPE in history_gemma.MemoryAttention sees the same geometry train and eval.
+    # That invariant is covered by test_{reduce_round,hierarchical_reduce,
+    # tree_nodes}_preserve_time_order below.
     ml, cfg = build(pool_budget=2048, **ML)
     base, _ = build(pool_budget=2048)  # same arch + seed, multilevel off
     dim = cfg.memory_token_dim
@@ -390,6 +397,87 @@ def test_multilevel_call_path():
     print("OK multilevel_call_path")
 
 
+# ---------------------------------------------------------------------------
+# Temporal-order invariant. history_gemma.MemoryAttention keys its memory RoPE to
+# the array slot (k_positions = arange(mem_len)), so the sequence the reduction
+# hands it must be time-ordered or that positional signal is noise -- decorrelated
+# from time at eval, inconsistent with the multilevel leaf picks at train. Tag
+# every pool token with its frame index in channel 0 (the selector only *scores*
+# tokens; the gather carries channel 0 through untouched) and assert the surviving
+# (valid) tokens come out strictly increasing in that tag, for one round, for the
+# full eval cascade, and for every multilevel tree node.
+# ---------------------------------------------------------------------------
+
+def _time_tagged_pool(cfg, b=3, n_real=None, seed=0):
+    """(hidden, valid): hidden[..., 0] == frame index, other channels small noise.
+    n_real: None -> all real; else a length-`b` list of real-token counts (the
+    pool is right-padded, so real tokens occupy the low indices)."""
+    rng = np.random.default_rng(seed)
+    p, d = cfg.pool_budget, cfg.memory_token_dim
+    h = jnp.asarray(rng.standard_normal((b, p, d)) * 0.1, dtype=jnp.float32)
+    h = h.at[:, :, 0].set(jnp.arange(p, dtype=jnp.float32)[None, :])
+    if n_real is None:
+        v = jnp.ones((b, p), dtype=bool)
+    else:
+        assert len(n_real) == b
+        v = jnp.asarray(np.arange(p)[None, :] < np.asarray(n_real)[:, None])
+    return h, v
+
+
+def _assert_time_sorted(h, v, label):
+    h, v = np.asarray(h), np.asarray(v)
+    for i in range(h.shape[0]):
+        tags = h[i, :, 0][v[i].astype(bool)]
+        diffs = np.diff(tags)
+        assert np.all(diffs > 0), (
+            f"{label}: row {i} survivors not strictly increasing in frame index "
+            f"(min diff {diffs.min() if diffs.size else 'n/a'}); first tags {tags[:16]}"
+        )
+
+
+def test_reduce_round_preserves_time_order():
+    for pool_budget in (1024, 2048, 4096):
+        model, cfg = build(pool_budget=pool_budget)
+        h, v = _time_tagged_pool(cfg, b=3, seed=pool_budget)
+        rh, rv = model._reduce_one_round(h, v)
+        _assert_time_sorted(rh, rv, f"_reduce_one_round(pool={pool_budget}, full)")
+        # partial pool: row 0 full, row 1 ~half, row 2 just under one chunk
+        n_real = [pool_budget, pool_budget // 2 + 3, cfg.budget - 5]
+        h, v = _time_tagged_pool(cfg, b=3, n_real=n_real, seed=pool_budget + 1)
+        rh, rv = model._reduce_one_round(h, v)
+        _assert_time_sorted(rh, rv, f"_reduce_one_round(pool={pool_budget}, partial)")
+    print("OK reduce_round_preserves_time_order")
+
+
+def test_hierarchical_reduce_preserves_time_order():
+    for pool_budget in (1024, 2048, 4096, 8192):
+        model, cfg = build(pool_budget=pool_budget)
+        for tag, n_real in (
+            ("full", None),
+            ("partial", [pool_budget, pool_budget // 3, cfg.budget + 7]),
+        ):
+            h, v = _time_tagged_pool(cfg, b=3, n_real=n_real, seed=pool_budget)
+            rh, rv = model._hierarchical_reduce(h, v)
+            assert rh.shape[1] == model.reduced_len, (pool_budget, rh.shape)
+            _assert_time_sorted(rh, rv, f"_hierarchical_reduce(pool={pool_budget}, {tag})")
+    print("OK hierarchical_reduce_preserves_time_order")
+
+
+def test_tree_nodes_preserve_time_order():
+    for pool_budget in (1024, 2048, 4096):
+        model, cfg = build(pool_budget=pool_budget, **ML)
+        h, v = _time_tagged_pool(cfg, b=4, seed=pool_budget)
+        for node in range(model.n_nodes):  # every leaf, middle and root node
+            picked = jnp.full((h.shape[0],), node, dtype=jnp.int32)
+            ph, pv = model._tree_pick_input(h, v, picked)
+            _assert_time_sorted(ph, pv, f"_tree_pick_input(pool={pool_budget}, node={node})")
+        # mixed per-sample picks in one call
+        picked = jnp.arange(4, dtype=jnp.int32) % model.n_nodes
+        ph, pv = model._tree_pick_input(h, v, picked)
+        _assert_time_sorted(ph, pv, f"_tree_pick_input(pool={pool_budget}, mixed)")
+    print("OK tree_nodes_preserve_time_order")
+
+
 if __name__ == "__main__":
     test_round_math()
     test_reduction_deterministic()
@@ -403,4 +491,7 @@ if __name__ == "__main__":
     test_multilevel_static_shape()
     test_multilevel_gradient_routing()
     test_multilevel_call_path()
+    test_reduce_round_preserves_time_order()
+    test_hierarchical_reduce_preserves_time_order()
+    test_tree_nodes_preserve_time_order()
     print("\nall hierarchical_selection checks passed")
