@@ -1,0 +1,44 @@
+budget: 64           # post-reduction sequence length (what the backbone pays for)
+pool_budget: 64      # degenerate control: pool == budget -> 0 reduction rounds.
+                     # _hierarchical_reduce is a no-op; plain learned 64->32 hard
+                     # cut on an evenly-spaced 4-frame pool (token_per_image 16).
+                     # Matched no-hierarchical control for
+                     # perceptual-hiersel-modul_bud64_pool128_multilevel -- isolates
+                     # "does the 1 reduction round help / hurt?" now that survivors
+                     # stay in temporal order (0464533). multilevel is moot at 0
+                     # rounds (n_nodes == 1), so it's left off.
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even
+  selector:
+    enabled: true
+    keep_ratio: 0.5   # learned cut: budget -> round(budget * keep_ratio) = 64 -> 32
+    depth: 2
+    num_heads: 8
+    num_register_tokens: 4
+    ratio_loss_weight: 0.001
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 0.1   # match perceptual-hiersel-modul_bud64_pool128_multilevel
