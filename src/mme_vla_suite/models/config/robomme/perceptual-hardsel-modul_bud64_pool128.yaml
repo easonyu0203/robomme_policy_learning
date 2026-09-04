@@ -1,0 +1,52 @@
+budget: 64           # tokens fed to the trained selector cut (4 frames at token_per_image 16)
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: random_sampling
+  # Two-stage frame pick (data loader, shared/mem_buffer.py::get_random_sampling_indices):
+  #   1. a `pool_budget`-wide EVENLY-SPACED frame grid over the causal history
+  #      (128 tokens -> 8 frames), then
+  #   2. a fresh UNIFORMLY-RANDOM `budget`-wide subset of that grid every step
+  #      (64 tokens -> 4 frames), train and eval alike,
+  # then the trained selector cut below.
+  #
+  # Single-variable step from perceptual-hiersel-modul_bud64_pool64.yaml: at pool64 the
+  # random pick is 4-choose-4 (identity) and hierarchical_selection runs 0 reduction
+  # rounds, so pool64-randsample == pool64-hiersel ("even-sample 4 frames -> selector
+  # 64->32"). pool128 is the first config where the random subsampling does something
+  # (random 4 of 8), and the random-drop control for
+  # perceptual-hiersel-modul_bud64_pool128_multilevel (learned 8->4 reduction vs random).
+  #
+  # Keep `pool_budget` nested under `perceptual_memory` -- NOT at top level (that is the
+  # hierarchical_selection knob; history_pi0.py would mis-size the observation spec).
+  pool_budget: 128
+  selector:
+    enabled: true
+    keep_ratio: 0.5   # trained cut: budget -> round(budget * keep_ratio) = 64 -> 32
+    depth: 2
+    num_heads: 8
+    num_register_tokens: 4
+    ratio_loss_weight: 0.001
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 0.1   # match perceptual-hiersel-modul_bud64_pool64.yaml

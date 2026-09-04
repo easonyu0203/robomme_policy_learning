@@ -149,9 +149,11 @@ class MME_VLA_Policy:
                         self.step_idx, token_budget, history_feats_gather_fn)
             elif self.config.perceptual_memory.type == "random_sampling":
                 token_per_image = self.config.token_per_image
+                pool_budget = self.config.perceptual_memory.get("pool_budget", None)
                 static_image_emb, static_pos_emb, static_state_emb, static_time_emb, static_mask = \
                     self.mem_buffer.prepare_random_sampling(
-                        self.step_idx, token_budget, token_per_image, history_feats_gather_fn)
+                        self.step_idx, token_budget, token_per_image, history_feats_gather_fn,
+                        pool_budget=pool_budget)
             elif self.config.perceptual_memory.type == "frame_sampling":
                 token_per_image = self.config.token_per_image
                 static_image_emb, static_pos_emb, static_state_emb, static_time_emb, static_mask = \

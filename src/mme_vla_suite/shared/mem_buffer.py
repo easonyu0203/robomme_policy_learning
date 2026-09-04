@@ -327,18 +327,35 @@ class MemoryBuffer:
         return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image, step_idx)
 
 
-    def get_random_sampling_indices(self, step_idx, token_budget, token_per_image, rng=None):
+    def get_random_sampling_indices(self, step_idx, token_budget, token_per_image, rng=None, pool_budget=None):
         # random_sampling: identical "N frames x token_per_image" packing as frame_sampling,
         # just with a uniformly random subset of history frames instead of an evenly-spaced one.
+        #
+        # `pool_budget` (tokens) restricts the random pick to a `pool_budget // tokens_per_frame`
+        # -wide *evenly-spaced* frame grid (even_sampling_indices) instead of the raw causal
+        # history -- bounds the temporal spacing of the candidate set while keeping the pick
+        # stochastic (a fresh subset every call, train and eval alike). `pool_budget=None` ->
+        # pool == the whole causal history, i.e. the original flat-uniform behaviour
+        # (equivalently pool_budget -> infinity).
         rng = rng if rng is not None else np.random
-        max_size = token_budget // (token_per_image * self.num_views)
+        n_per_frame = token_per_image * self.num_views
+        max_size = token_budget // n_per_frame
         n_available = step_idx + 1  # causal: frames 0..step_idx are all we're allowed to see
-        size = min(max_size, n_available)
-        return sorted(int(i) for i in rng.choice(n_available, size=size, replace=False))
+        if pool_budget is None:
+            pool = list(range(n_available))
+        else:
+            pool_size = max(1, pool_budget // n_per_frame)
+            # linspace rounding can repeat indices once pool_size approaches n_available;
+            # dedupe so `replace=False` below still has that many distinct frames to draw.
+            pool = sorted(set(even_sampling_indices(step_idx, pool_size)))
+        size = min(max_size, len(pool))
+        picked = rng.choice(len(pool), size=size, replace=False)
+        return sorted(int(pool[i]) for i in picked)
 
 
-    def prepare_random_sampling(self, step_idx, token_budget, token_per_image, history_feats_gather_fn, rng=None, *args, **kwargs):
-        indices_to_load = self.get_random_sampling_indices(step_idx, token_budget, token_per_image, rng=rng)
+    def prepare_random_sampling(self, step_idx, token_budget, token_per_image, history_feats_gather_fn, rng=None, pool_budget=None, *args, **kwargs):
+        indices_to_load = self.get_random_sampling_indices(
+            step_idx, token_budget, token_per_image, rng=rng, pool_budget=pool_budget)
         history_feats = history_feats_gather_fn(indices_to_load, *args, **kwargs)
         # packing/padding only depends on *which* indices were chosen, not how -- reuse it as-is.
         return self._prepare_frame_sampling(history_feats, indices_to_load, token_budget, token_per_image, step_idx)

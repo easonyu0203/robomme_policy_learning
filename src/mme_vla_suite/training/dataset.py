@@ -141,10 +141,13 @@ class RoboMMEDataset(Dataset):
     def prepare_random_sampling(self, epis_idx, step_idx):
         token_per_image = self.history_config.token_per_image
         token_budget = self.history_config.budget
+        # Optional: draw the random subset from a `pool_budget`-wide evenly-spaced
+        # frame grid instead of the raw causal history (see get_random_sampling_indices).
+        pool_budget = self.history_config.perceptual_memory.get("pool_budget", None)
 
         return self.mem_buffer.prepare_random_sampling(
             step_idx, token_budget, token_per_image, self._gather_history_feat,
-            epis_idx=epis_idx)
+            pool_budget=pool_budget, epis_idx=epis_idx)
 
 
     def prepare_hierarchical_selection(self, epis_idx, step_idx):

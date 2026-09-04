@@ -1,0 +1,51 @@
+budget: 64            # tokens fed to the backbone-facing selector (4 frames at token_per_image 16)
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: random_sampling
+  # Two-stage frame pick (data loader, see shared/mem_buffer.py::get_random_sampling_indices):
+  #   1. `pool_budget`-wide EVENLY-SPACED frame grid over the causal history
+  #      (256 tokens -> 16 frames), then
+  #   2. a fresh UNIFORMLY-RANDOM `budget`-wide subset of that grid every step
+  #      (64 tokens -> 4 frames), train and eval alike.
+  # The even grid bounds temporal spacing / guarantees whole-episode coverage;
+  # the random subset keeps the selector's input varying step to step so a fixed
+  # positional stencil can't stay optimal (hiersel selector-collapse lever).
+  # Omit `pool_budget` -> flat-uniform pick over the raw causal history (original behaviour).
+  #
+  # Keep this nested under `perceptual_memory` -- NOT at top level. A top-level `pool_budget`
+  # is the hierarchical_selection knob and history_pi0.py sizes the observation spec from it
+  # unconditionally; here the loader still ships `budget` tokens, so a top-level copy would
+  # crash with a shape mismatch. percep_mem.py's `input_len` stays `budget` for this mode.
+  pool_budget: 256
+  selector:
+    enabled: true
+    keep_ratio: 0.5  # trained cut: `budget` -> round(budget * keep_ratio) at inference (64 -> 32)
+    depth: 2         # selector transformer depth -- kept small relative to the backbone
+    num_heads: 8
+    num_register_tokens: 4
+    # "lbfix2" weights (see perceptual-hardsel-modul.yaml): keep the router from collapsing.
+    ratio_loss_weight: 0.001
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 1e-4
