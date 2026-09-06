@@ -43,12 +43,13 @@ def select_topk(logits: jnp.ndarray, valid_mask: jnp.ndarray, num_keep: int) -> 
     return jax.lax.top_k(margin, num_keep)[1]
 
 
-def zscore_margin(margin: jnp.ndarray, valid_mask: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+def zscore_margin(margin: jnp.ndarray, valid_mask: jnp.ndarray, eps: float = 1e-4) -> jnp.ndarray:
     """Standardize keep-margins within each sequence over its valid tokens.
 
     rsqrt form, not `/ std`: the gradient of sqrt at zero variance is inf, so an
-    all-equal chunk (e.g. all padding) would emit NaN grads. Invalid positions
-    are excluded from the statistics and come back as 0."""
+    all-equal chunk (e.g. all padding) would emit NaN grads; eps=1e-4 also caps
+    the gain at 100x when all valid margins coincide. Invalid positions are
+    excluded from the statistics and come back as 0."""
     valid = valid_mask.astype(margin.dtype)
     n = jnp.clip(valid.sum(-1, keepdims=True), a_min=1.0)
     mean = (margin * valid).sum(-1, keepdims=True) / n

@@ -538,9 +538,9 @@ def test_ema_reducer_scoring_uses_the_passed_selector():
 
         # (c) end-to-end through __call__ (non-multilevel: deterministic cascade).
         if not ml:
-            h0, _, _ = _forward_red(model, img, pos, state, time, mask, None,
+            h0, _, _, _ = _forward_red(model, img, pos, state, time, mask, None,
                                     train=True, rng=jax.random.key(0))
-            h1, _, _ = _forward_red(model, img, pos, state, time, mask,
+            h1, _, _, _ = _forward_red(model, img, pos, state, time, mask,
                                     _twin_selector(cfg, seed=pool_budget + 2),
                                     train=True, rng=jax.random.key(0))
             assert h0.shape == (img.shape[0], budget, cfg.memory_token_dim)
@@ -556,14 +556,14 @@ def test_ema_reducer_final_cut_still_uses_live_selector():
     twin = _twin_selector(cfg, seed=99)
     rng = jax.random.key(1)
 
-    _, w0, _ = _forward_red(model, img, pos, state, time, mask, twin, train=True, rng=rng)
+    _, w0, _, _ = _forward_red(model, img, pos, state, time, mask, twin, train=True, rng=rng)
     # Perturb ONLY the live selector's head keep-channel bias -> shifts the
     # keep/drop *margin* (not an equal shift that would cancel), so the final
     # cut's decision changes. Reaches `w` only via the final cut; the reduction
     # uses `twin`, untouched.
     head = model.selector.head
     head.bias = nnx.Param(head.bias.value.at[0].add(12.0))
-    _, w1, _ = _forward_red(model, img, pos, state, time, mask, twin, train=True, rng=rng)
+    _, w1, _, _ = _forward_red(model, img, pos, state, time, mask, twin, train=True, rng=rng)
     assert not jnp.allclose(w0, w1), "final cut ignored the live selector"
     print("OK ema_reducer_final_cut_still_uses_live_selector")
 
