@@ -16,9 +16,9 @@ WANDB_OVERLAY=${WANDB_OVERLAY:-/workspace/mnt/mywang87/0Xuehui/wandb_overlay}
 PROXY=${PROXY:-http://10.2.83.188:3128}
 GPUS=${GPUS:-0,1,2,3}; MEM_FRAC=${MEM_FRAC:-0.85}; DATASET_TYPE=${DATASET_TYPE:-auto}
 
-# dataset format: bin (per-episode image_emb_*/episode_*.bin from convert_features_to_bin.py) or npy (build_dataset.py)
+# dataset format: bin reads <DATA>/features_bin/image_emb_*/<episode>.bin (convert_features_to_bin.py); npy reads <DATA>/features
 if [ "$DATASET_TYPE" = auto ]; then
-  if ls "$DATA"/image_emb_4x4/*.bin >/dev/null 2>&1; then DATASET_TYPE=bin; else DATASET_TYPE=npy; fi
+  if ls "$DATA"/features_bin/image_emb_4x4/*.bin >/dev/null 2>&1; then DATASET_TYPE=bin; else DATASET_TYPE=npy; fi
   echo "dataset type auto-detected: $DATASET_TYPE   ($(ls "$DATA" | head -6 | tr "\n" " "))"
 fi
 
