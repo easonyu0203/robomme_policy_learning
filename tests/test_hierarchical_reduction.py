@@ -599,7 +599,7 @@ def test_ema_reducer_gradient_routing():
     rng = jax.random.key(4)
 
     def loss_fn(m, scorer):
-        h, w, _ = m(img, pos, state, time, mask, train=True, rng=rng, reducer_selector=scorer)
+        h, w, _, _ = m(img, pos, state, time, mask, train=True, rng=rng, reducer_selector=scorer)
         return h.mean() + w.mean()
 
     # scorer is arg 1 -> non-differentiated module arg (same as scripts/train.py).
