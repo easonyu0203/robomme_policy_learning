@@ -24,6 +24,14 @@ fi
 
 cd "$DNR_ROOT"
 [ -f "src/mme_vla_suite/models/config/robomme/$YAML" ] || { echo "missing history yaml: $YAML"; exit 1; }
+# norm stats: the trainer reads runs/assets/mme_vla_suite/robomme/norm_stats.json under this checkout;
+# a fresh checkout has none -> link the a2r repo's (same dataset) unless NORM_STATS_SRC overrides.
+NS=runs/assets/mme_vla_suite/robomme/norm_stats.json
+NORM_STATS_SRC=${NORM_STATS_SRC:-/workspace/mnt/mywang87/0Xuehui/robomme_a2r/runs/assets/mme_vla_suite/robomme/norm_stats.json}
+if [ ! -f "$NS" ]; then
+  [ -f "$NORM_STATS_SRC" ] || { echo "missing norm stats: $NS (and no source at $NORM_STATS_SRC)"; exit 1; }
+  mkdir -p "$(dirname "$NS")" && cp "$NORM_STATS_SRC" "$NS" && echo "norm stats copied from $NORM_STATS_SRC"
+fi
 [ -d "$DATA" ] || { echo "missing dataset dir: $DATA"; exit 1; }
 [ -x "$VENV_PY" ] || { echo "missing venv python: $VENV_PY"; exit 1; }
 [ -d "$WANDB_OVERLAY" ] || { echo "missing wandb overlay: $WANDB_OVERLAY (needed for W&B 0.29 / 86-char key)"; exit 1; }
