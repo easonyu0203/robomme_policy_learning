@@ -48,8 +48,9 @@ class MemoryAttention(nn.Module):
     Use action sequence to attend memory sequence.
     """
     @nn.compact
-    def __call__(self, x, mem_seq, mem_mask):
+    def __call__(self, x, mem_seq, mem_mask, mem_pos=None):
         # x: [B, T, D], mem_seq: [B, S, D], mem_mask: [B, S]
+        # mem_pos: [B, S] int32 steps-ago per memory token, or None.
         B, mem_len, mem_width = mem_seq.shape
         B, x_len, x_width = x.shape
         # Let's hardcode the values for now
@@ -81,10 +82,19 @@ class MemoryAttention(nn.Module):
         mem_seq = rms_norm(mem_seq)
         k, v = kv_einsum("BSD,2KDH->2BSKH", mem_seq)
         
-        q_positions = einops.repeat(
-            jnp.arange(mem_len, x_len + mem_len), "t -> b t", b=B
-        )
-        k_positions = einops.repeat(jnp.arange(mem_len), "t -> b t", b=B)
+        if mem_pos is None:
+            # Legacy: RoPE keyed to the array slot (memory = prefix 0..S-1, action
+            # tokens continue at S..). Not permutation- or length-invariant.
+            q_positions = einops.repeat(
+                jnp.arange(mem_len, x_len + mem_len), "t -> b t", b=B
+            )
+            k_positions = einops.repeat(jnp.arange(mem_len), "t -> b t", b=B)
+        else:
+            # mem_rope=time: key phase = steps-ago of that memory token, query
+            # phase = 0 ("now"), so the relative phase is exactly the recency and
+            # is independent of slot order, selection or gathering.
+            q_positions = jnp.zeros((B, x_len), dtype=jnp.int32)
+            k_positions = mem_pos.astype(jnp.int32)
         
         q = _apply_rope(q, positions=q_positions)
         q *= head_dim**-0.5
@@ -140,6 +150,7 @@ class HistoryBlock(nn.Module):
         adarms_cond,
         mem_seq,
         mem_mask,
+        mem_pos=None,
         deterministic=True,
     ):  # noqa: FBT002
 
@@ -186,7 +197,9 @@ class HistoryBlock(nn.Module):
             if x is not None:
                 # Add Memory Modulation before FFN
                 if i == len(xs) - 1 and self.integration_type == "modulation":
-                    mem_mod_vec = mem_attn(x, mem_seq[-1], mem_mask[-1])
+                    mem_mod_vec = mem_attn(
+                        x, mem_seq[-1], mem_mask[-1], None if mem_pos is None else mem_pos[-1]
+                    )
                     x = MemoryRMSNorm(name="mem_rms_norm_ffn")(x, mem_mod_vec)  
                 
                 name=_name("pre_ffw_norm", i) if self.integration_type != "expert" else _name("pre_ffw_norm", i-1)
@@ -246,7 +259,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             HistoryBlock,
             prevent_cse=False,
-            static_argnums=(7,),  # 0=xs, 5=decode
+            static_argnums=(8,),  # deterministic (0=xs ... 7=mem_pos)
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -261,7 +274,8 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=deterministic
+                nn.broadcast,
+            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=mem_pos, 7=deterministic
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -289,6 +303,7 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
         mem_mask: Sequence[at.Float[at.Array, "b lmem"] | None] | None = None,
+        mem_pos: Sequence[at.Int[at.Array, "b lmem"] | None] | None = None,
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
@@ -304,6 +319,7 @@ class Module(nn.Module):
             adarms_cond,
             mem_seq,
             mem_mask,
+            mem_pos,
             deterministic,
         )
 

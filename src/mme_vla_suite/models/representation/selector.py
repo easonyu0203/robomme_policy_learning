@@ -43,6 +43,75 @@ def select_topk(logits: jnp.ndarray, valid_mask: jnp.ndarray, num_keep: int) -> 
     return jax.lax.top_k(margin, num_keep)[1]
 
 
+def zscore_margin(margin: jnp.ndarray, valid_mask: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+    """Standardize keep-margins within each sequence over its valid tokens.
+
+    rsqrt form, not `/ std`: the gradient of sqrt at zero variance is inf, so an
+    all-equal chunk (e.g. all padding) would emit NaN grads. Invalid positions
+    are excluded from the statistics and come back as 0."""
+    valid = valid_mask.astype(margin.dtype)
+    n = jnp.clip(valid.sum(-1, keepdims=True), a_min=1.0)
+    mean = (margin * valid).sum(-1, keepdims=True) / n
+    centred = (margin - mean) * valid
+    var = (centred * centred).sum(-1, keepdims=True) / n
+    return centred * jax.lax.rsqrt(var + eps)
+
+
+def gumbel_topk(
+    logits: jnp.ndarray,
+    valid_mask: jnp.ndarray,
+    num_keep: int,
+    rng: jax.Array | None = None,
+    *,
+    tau: float = 1.0,
+    noise_scale: float = 1.0,
+    score_norm: str = "zscore",
+    eps: float = 1e-9,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Exactly-`num_keep` straight-through top-k over keep margins (Gumbel-top-k,
+    Kool et al. 2019, with a sigmoid relaxation for the backward pass).
+
+    Forward: `weight` is exactly {0,1} with `num_keep` ones among the valid
+    tokens (fewer only when fewer valid tokens exist); padding is never kept.
+    Backward: token i's weight is relaxed to sigmoid((s_i - thr) / tau), s_i its
+    (noised) margin and thr the midpoint between the k-th kept and the best
+    dropped margin (stop_gradient). The gradient wrt the selector's logits is
+    therefore y(1-y)/tau -- the 2-class Gumbel-softmax gradient with the
+    decision threshold moved from 0 to the data-dependent k-th value. Because
+    the count is exact, no ratio / load-balance loss is needed; `score_norm`
+    = "zscore" pins the margin scale, so no z-loss is needed either.
+
+    rng=None -> deterministic (deployment): same rule without noise, so train
+    and eval differ only by the Gumbel noise.
+
+    Returns (weight (B, L) float32, idx (B, num_keep) int32 sorted ascending,
+    i.e. in time order for a time-sorted, left-packed sequence).
+    """
+    margin = (logits[..., 0] - logits[..., 1]).astype(jnp.float32)
+    if score_norm == "zscore":
+        margin = zscore_margin(margin, valid_mask)
+    if rng is not None and noise_scale > 0:
+        u = jax.random.uniform(rng, margin.shape, minval=eps, maxval=1.0 - eps)
+        margin = margin + noise_scale * (-jnp.log(-jnp.log(u)))
+    masked = jnp.where(valid_mask, margin, -jnp.inf)
+    kth_vals, idx = jax.lax.top_k(masked, num_keep)  # value-sorted, descending
+    b_idx = jnp.arange(margin.shape[0])[:, None]
+    keep_hard = jnp.zeros_like(valid_mask).at[b_idx, idx].set(True) & valid_mask
+    kth = kth_vals[:, -1]
+    best_dropped = jnp.max(jnp.where(valid_mask & ~keep_hard, margin, -jnp.inf), axis=-1)
+    thr = jnp.where(
+        jnp.isfinite(best_dropped),
+        0.5 * (kth + best_dropped),
+        jnp.where(jnp.isfinite(kth), kth - 1.0, 0.0),
+    )
+    thr = jax.lax.stop_gradient(thr)[:, None]
+    safe_margin = jnp.where(valid_mask, margin, 0.0)
+    y_soft = jax.nn.sigmoid((safe_margin - thr) / tau)
+    y_hard = keep_hard.astype(jnp.float32)
+    weight = (jax.lax.stop_gradient(y_hard - y_soft) + y_soft) * valid_mask.astype(jnp.float32)
+    return weight, jnp.sort(idx, axis=-1).astype(jnp.int32)
+
+
 def selector_losses(
     logits: jnp.ndarray, decision: jnp.ndarray, valid_mask: jnp.ndarray, keep_ratio: float
 ) -> dict[str, jnp.ndarray]:

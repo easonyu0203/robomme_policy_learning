@@ -423,8 +423,9 @@ class HistoryPi0(BaseModel):
         rng: at.KeyArrayLike | None = None,
         reducer_selector: Any = None,
     ):
+        mem_pos = None
         if self.representation_type == "perceptual":
-            tokens, mem_mask, stats = self.mem_encoder(
+            tokens, mem_mask, stats, mem_pos = self.mem_encoder(
                 obs.static_image_emb,
                 obs.static_pos_emb,
                 obs.static_state_emb,
@@ -457,7 +458,8 @@ class HistoryPi0(BaseModel):
             ar_mask = None
             na_mask = None
             stats = None
-        return tokens, input_mask, ar_mask, na_mask, stats
+        # mem_pos: (b, S) int32 steps-ago per memory token (mem_rope=time) or None.
+        return tokens, input_mask, ar_mask, na_mask, stats, mem_pos
 
     @at.typecheck
     def embed_prefix(
@@ -481,6 +483,7 @@ class HistoryPi0(BaseModel):
                 mem_ar_mask,
                 mem_na_mask,
                 stats,
+                _mem_pos,
             ) = self.embed_memory(obs)
             if mem_tokens is not None:
                 tokens.append(mem_tokens)
@@ -626,7 +629,7 @@ class HistoryPi0(BaseModel):
         )
         
         if self.integration_type == "expert":
-            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, stats = (
+            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, stats, _ = (
                 self.embed_memory(observation)
             )
             mem_ar_mask = jnp.array(mem_ar_mask)
@@ -660,7 +663,7 @@ class HistoryPi0(BaseModel):
                 adarms_cond=[None, None, adarms_cond],
             )
         elif self.integration_type == "modulation":
-            mem_seq, mem_mask, _, _, stats = self.embed_memory(
+            mem_seq, mem_mask, _, _, stats, mem_pos = self.embed_memory(
                 observation, train=train, rng=selector_rng, reducer_selector=reducer_selector
             )
             mem_mask = mem_mask.astype(jnp.float32) if mem_mask is not None else None
@@ -671,6 +674,7 @@ class HistoryPi0(BaseModel):
                 adarms_cond=[None, adarms_cond],
                 mem_seq=[None, mem_seq],
                 mem_mask=[None, mem_mask],
+                mem_pos=None if mem_pos is None else [None, mem_pos],
             )
         else:
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
@@ -714,7 +718,7 @@ class HistoryPi0(BaseModel):
             )
 
         if self.integration_type == "expert":
-            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, _ = self.embed_memory(observation)
+            mem_tokens, mem_input_mask, mem_ar_mask, mem_na_mask, _, _ = self.embed_memory(observation)
             vlm_tokens, vlm_mask, vlm_ar_mask, vlm_na_mask, _ = self.embed_prefix(observation)
             mem_ar_mask = jnp.array(mem_ar_mask)
             mem_na_mask = jnp.array(mem_na_mask)
@@ -738,7 +742,7 @@ class HistoryPi0(BaseModel):
             _, kv_cache = self.PaliGemma.llm(
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
             )
-            mem_seq, mem_mask, _, _, _ = self.embed_memory(observation, train=False)
+            mem_seq, mem_mask, _, _, _, mem_pos = self.embed_memory(observation, train=False)
             mem_mask = mem_mask.astype(jnp.float32) if mem_mask is not None else None
             
         else:
@@ -801,6 +805,7 @@ class HistoryPi0(BaseModel):
                     adarms_cond=[None, adarms_cond],
                     mem_seq=[None, mem_seq],
                     mem_mask=[None, mem_mask],
+                    mem_pos=None if mem_pos is None else [None, mem_pos],
                 )
             else:
                 (prefix_out, suffix_out), _ = self.PaliGemma.llm(

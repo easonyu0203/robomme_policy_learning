@@ -78,7 +78,7 @@ def test_round_math():
     hid = model.feature_encoder.encode_perceptual_memory(img, pos, state, time)
     h, v = model._hierarchical_reduce(hid, mask)
     assert h.shape == hid.shape and jnp.array_equal(v, mask)
-    ht, wt, lt = _forward(model, img, pos, state, time, mask, train=True, rng=jax.random.key(0))
+    ht, wt, lt, _ = _forward(model, img, pos, state, time, mask, train=True, rng=jax.random.key(0))
     assert ht.shape == (2, 512, cfg.memory_token_dim) and jnp.isfinite(ht).all()
     print("OK round_math")
 
@@ -89,7 +89,7 @@ def test_shapes_and_finite():
     for n_real in (50, 600, 1500, None):
         img, pos, state, time, mask = rand_inputs(cfg, n_real=n_real, seed=n_real or 0)
 
-        h, w, losses = _forward(model, img, pos, state, time, mask,
+        h, w, losses, _ = _forward(model, img, pos, state, time, mask,
                                 train=True, rng=jax.random.key(1))
         assert h.shape == (2, cfg.budget, dim), h.shape
         assert w.shape == (2, cfg.budget), w.shape
@@ -100,7 +100,7 @@ def test_shapes_and_finite():
         # Eval keeps length == `budget` and masks in place (same as train) --
         # NOT a physical gather; see percep_mem.py's eval branch for why the
         # position-sensitive MemoryAttention consumer forbids repacking.
-        gh, gm, stats = _forward(model, img, pos, state, time, mask,
+        gh, gm, stats, _ = _forward(model, img, pos, state, time, mask,
                                  train=False, rng=jax.random.key(1))
         assert gh.shape == (2, cfg.budget, dim), gh.shape
         assert gm.shape == (2, cfg.budget), gm.shape
@@ -129,7 +129,7 @@ def test_eval_keep_all():
         for n_real in (300, 700, None):
             img, pos, state, time, mask = rand_inputs(cfg, n_real=n_real, seed=n_real or 1)
 
-            gh, gm, _ = _forward(model, img, pos, state, time, mask,
+            gh, gm, _, _ = _forward(model, img, pos, state, time, mask,
                                  train=False, rng=jax.random.key(1))
             assert gh.shape == (2, cfg.budget, dim), (pool_budget, gh.shape)
             assert gm.shape == (2, cfg.budget), gm.shape
@@ -141,14 +141,14 @@ def test_eval_keep_all():
             assert jnp.array_equal(gm.astype(bool), red_valid), (pool_budget, n_real)
 
             # and that is strictly more than the trained cut would keep
-            _, base_m, _ = _forward(base, img, pos, state, time, mask,
+            _, base_m, _, _ = _forward(base, img, pos, state, time, mask,
                                     train=False, rng=jax.random.key(1))
             assert gm.sum() >= base_m.sum(), (pool_budget, n_real)
             if n_real != 300:
                 assert (gm.sum(axis=1) > model.num_keep).all(), (pool_budget, n_real)
 
         # train still does the Gumbel cut -- keep-weight is not the plain mask
-        _, wt, _ = _forward(model, img, pos, state, time, mask,
+        _, wt, _, _ = _forward(model, img, pos, state, time, mask,
                             train=True, rng=jax.random.key(2))
         assert wt.shape == (2, cfg.budget)
     print("OK eval_keep_all")
@@ -383,7 +383,7 @@ def test_multilevel_call_path():
     dim = cfg.memory_token_dim
     img, pos, state, time, mask = rand_inputs(cfg, n_real=1400, seed=11)
 
-    h, w, losses = _forward(ml, img, pos, state, time, mask,
+    h, w, losses, _ = _forward(ml, img, pos, state, time, mask,
                             train=True, rng=jax.random.key(1))
     assert h.shape == (2, cfg.budget, dim) and w.shape == (2, cfg.budget)
     assert jnp.isfinite(h).all() and jnp.isfinite(w).all()
@@ -392,8 +392,8 @@ def test_multilevel_call_path():
         assert k in losses, k
 
     # eval ignores multilevel -> identical to the non-multilevel model
-    he, we, _ = _forward(ml, img, pos, state, time, mask, train=False, rng=jax.random.key(1))
-    hb, wb, _ = _forward(base, img, pos, state, time, mask, train=False, rng=jax.random.key(1))
+    he, we, _, _ = _forward(ml, img, pos, state, time, mask, train=False, rng=jax.random.key(1))
+    hb, wb, _, _ = _forward(base, img, pos, state, time, mask, train=False, rng=jax.random.key(1))
     assert jnp.array_equal(he, hb) and jnp.array_equal(we, wb)
     print("OK multilevel_call_path")
 
