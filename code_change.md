@@ -23,6 +23,23 @@ They decompose the failure into two distinct misalignments:
 Critically, Fig 2(b): "**even without losing any visual tokens**, the presence of both types of misalignment alone results in performance degradation on RefCOCO." That isolates position IDs from information loss. GAP's fix = "reconstruct the position IDs as they were prior to pruning." MiniGPTv2: 88.69% → 2.73% (pruned) → 68.91% (GAP). Tested on PruMerge, TRIM, CLS-similarity, text-visual similarity, random, spatial — **not** FastV/SparseVLM/VisionZip.
 
 
+## 配置基线：与 hiersel_bud64_pool128_multilevel_emareducer 的对比
+
+`perceptual-dnr-modul_bud64_pool128.yaml` 从 `perceptual-hiersel-modul_bud64_pool128_multilevel_emareducer.yaml` 改出。
+
+不变的部分：budget 64、pool_budget 128、type hierarchical_selection、pool_sampling even、keep_ratio 0.5、selector depth 2 / 8 heads / 4 register、memory_feature、modulation 集成、use_time_emb true。也就是同一棵 3 节点树（8 帧 128 token，一轮 128→64，root 64→32），同样的 selector 结构。
+
+改动的行（每行对应下面的三处修复）：
+
+| 项 | hiersel_emareducer（旧） | dnr（新） | 对应修复 |
+|---|---|---|---|
+| `sampling` / `score_norm` / `tau` / `noise_scale` | 无（默认逐 token 伯努利） | topk / zscore / 1.0 / 1.0 | 1 Gumbel-Top-K |
+| `ratio` / `z` / `load_balance` 损失权重 | 1e-3 / 1e-4 / 0.1 | 全 0 | 1 |
+| `multilevel` / `ema_reducer` | true / true | false / false | 2 |
+| `e2e_tree` | 无 | true | 2 端到端树 |
+| `mem_rope`（根级） | 无（默认 slot） | time | 3 时间 RoPE |
+| `root_gather` | 无（默认 false，原位 mask） | true | 3 物理 gather |
+
 ## 三处改动
 
 ### 1. Gumbel-Top-K 替换逐 token 伯努利
