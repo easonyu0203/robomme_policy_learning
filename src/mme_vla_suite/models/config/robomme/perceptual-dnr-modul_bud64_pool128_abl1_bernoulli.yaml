@@ -1,0 +1,48 @@
+# ABLATION: fix 1 reverted -- root cut = legacy per-token Bernoulli + ratio/z/lb losses, in-place mask; e2e rounds + time RoPE kept
+budget: 64           # root width (2K): tokens the trained cut sees; K = 32 kept
+pool_budget: 128     # 8 even-spaced frames; 1 round (128->64) + root cut (64->32); 3 nodes
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true       # recency log1p(steps-ago); also the source of mem_rope=time positions
+mem_rope: time           # MemoryAttention keys RoPE by steps-ago, not array slot (gather-safe)
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even
+  selector:
+    enabled: true
+    keep_ratio: 0.5          # every node keeps K = 32 of its 2K = 64 inputs
+    depth: 2
+    num_heads: 8
+    num_register_tokens: 4
+    # ---- D&R fixes (2026-09-07) ----
+    sampling: bernoulli      # ABLATION: legacy per-token 2-class Gumbel-softmax at the root (random count)
+    score_norm: zscore       # pins the margin scale (replaces z-loss)
+    tau: 1.0                 # sigmoid width of the straight-through relaxation (z-scored units)
+    noise_scale: 1.0         # Gumbel noise scale in training (0 = deterministic)
+    e2e_tree: true           # full-tree backprop; replaces multilevel + ema_reducer
+    multilevel: false
+    ema_reducer: false
+    root_gather: false       # Bernoulli count is random -> mask in place (equivalent under time RoPE)
+    ratio_loss_weight: 0.001  # old hiersel lineage weights
+    z_loss_weight: 1e-4
+    load_balance_loss_weight: 0.1

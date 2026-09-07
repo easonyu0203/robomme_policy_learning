@@ -216,3 +216,29 @@ if __name__ == "__main__":
     test_memory_attention_time_rope()
     test_module_plumbing()
     print("ALL OK")
+
+
+def test_ablation_configs_build_and_run():
+    """The three single-fix ablations must construct and run train/eval forwards."""
+    import glob, os
+    for path in sorted(glob.glob("src/mme_vla_suite/models/config/robomme/perceptual-dnr-modul_bud64_pool128_abl*.yaml")):
+        cfg = OmegaConf.load(path)
+        model = PerceptualMemory(config=cfg, rngs=nnx.Rngs(0), dtype=jnp.float32)
+        img, pos, state, time, mask = rand_inputs(cfg, n_real=100, seed=1)
+        for train in (True, False):
+            tok, w, stats, mpos = model(img, pos, state, time, mask, train=train, rng=jax.random.key(2))
+            assert jnp.isfinite(tok).all() and w is not None
+            if model.root_gather:
+                assert tok.shape[1] == model.num_keep
+            else:
+                assert tok.shape[1] == cfg.budget
+            if model.sampling == "bernoulli" and train:
+                assert "ratio_loss" in stats and "load_balance_loss" in stats
+            else:
+                assert "ratio_loss" not in stats
+            assert (mpos is None) == (cfg.get("mem_rope", "slot") == "slot")
+        print("OK ablation config", os.path.basename(path), f"e2e={model.e2e_tree} sampling={model.sampling} rope={model.mem_rope} gather={model.root_gather}")
+
+
+if __name__ == "__main__":
+    test_ablation_configs_build_and_run()

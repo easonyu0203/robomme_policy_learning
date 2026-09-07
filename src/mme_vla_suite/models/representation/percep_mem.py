@@ -107,7 +107,9 @@ class PerceptualMemory(nnx.Module):
             )
             self.e2e_tree = bool(selector_cfg.get("e2e_tree", False))
             self.root_gather = bool(selector_cfg.get("root_gather", False))
-            assert not (self.e2e_tree and self.sampling != "topk"), "e2e_tree needs selector.sampling=topk"
+            # e2e reduction rounds always use gumbel_topk (a physical shrink needs an exact count);
+            # the ROOT cut may independently be "topk" or the legacy "bernoulli" (ablation of fix 1).
+            self.round_score_norm = selector_cfg.get("round_score_norm", "zscore")
             assert not (self.root_gather and self.sampling != "topk"), "root_gather needs selector.sampling=topk"
             assert not (self.root_gather and self.mem_rope != "time"), (
                 "root_gather needs mem_rope=time: slot-keyed RoPE is not gather-safe (see d738e40)"
@@ -191,7 +193,7 @@ class PerceptualMemory(nnx.Module):
             logits = self.selector(hc, vc)
             weight, idx = gumbel_topk(
                 logits, vc, keep, rng, tau=self.tau, noise_scale=self.noise_scale,
-                score_norm=self.score_norm,
+                score_norm=self.round_score_norm,
             )
             return idx, weight
         logits = jax.lax.stop_gradient((scorer if scorer is not None else self.selector)(hc, vc))
@@ -418,6 +420,11 @@ class PerceptualMemory(nnx.Module):
             decision = gumbel_softmax_hard(logits, rng)[..., 0]
             mem_weight = decision * valid_mask.astype(hidden_states.dtype)
             losses = selector_losses(logits, decision, valid_mask, self.keep_ratio)
+            if tpos is not None:
+                oldest = jnp.max(jnp.where(valid_mask, tpos, -1), axis=1, keepdims=True)
+                extra_stats["first_frame_keep_frac"] = jax.lax.stop_gradient(
+                    masked_mean(mem_weight, valid_mask & (tpos == oldest))
+                )
             return hidden_states, mem_weight, {**losses, **extra_stats}, tpos
 
         # Eval: deterministic top-`num_keep`, hard {0,1} keep-weight over the full
