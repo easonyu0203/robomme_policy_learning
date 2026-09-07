@@ -13,7 +13,7 @@
 
 结论：actor 从 slot 相位读"什么时候"，从内容读"是什么"。framesamp 的 slot k 永远对应相对时刻 k/31，所以它有一个免费的时钟；任何选择式记忆（TokenDrop、A2R、hiersel 的 gather）slot 到时间的映射随内容变，这个时钟就没了。TokenDrop 在 StopCube 上 5.3 对 framesamp 42.0 是同一个现象。
 
-Refer to:
+**Refer to:**
 > "pruning causes the accuracy of LLaVA on the RefCOCO validation set to drop from **56.14% to 15.34%**." "we identify **misaligned position IDs after pruning as the primary cause of this degradation**, as both the **order and value** of these IDs are crucial for maintaining performance in grounding tasks." GAP is "a simple yet effective adjustment to position IDs that recovers REC accuracy back to **51.42%**, which is 90% of the original performance" — no training, no extra memory/compute. from "Grounding-Aware Token Pruning (GAP)"
 
 They decompose the failure into two distinct misalignments:
@@ -22,7 +22,6 @@ They decompose the failure into two distinct misalignments:
 
 Critically, Fig 2(b): "**even without losing any visual tokens**, the presence of both types of misalignment alone results in performance degradation on RefCOCO." That isolates position IDs from information loss. GAP's fix = "reconstruct the position IDs as they were prior to pruning." MiniGPTv2: 88.69% → 2.73% (pruned) → 68.91% (GAP). Tested on PruMerge, TRIM, CLS-similarity, text-visual similarity, random, spatial — **not** FastV/SparseVLM/VisionZip.
 
-结果文件：`/home/storage/xuehui/a2r_eval/perm_results_seed7.txt`。
 
 ## 三处改动
 
@@ -38,7 +37,7 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 
 - 配置：`selector.e2e_tree: true`（默认 false），与 `multilevel`、`ema_reducer` 互斥
 - 代码：`percep_mem.py` 的 `_pick`、`_reduce_one_round_ext`、`_hierarchical_reduce_ext`
-- 因为开销基本不变甚至更低（前向不变（旧代码本来每个节点都跑 selector），多出各节点 selector 的反向），而且考虑会更稳定，就换成整棵树了。
+- 因为开销基本不变甚至更低（前向不变（旧代码本来每个节点都跑 selector），多出各节点 selector 的反向），而且考虑会更稳定、以及尽量避免distribution shift p(memory|history)（同时也尽量避免 p(action|obs, memory)的distribution shift）, 就换成整棵树了。
 
 
 ### 3. 时间编位 RoPE 加物理 gather
@@ -56,8 +55,6 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 | hiersel_pool128_multilevel_emareducer（旧） | 20.25 | 64 slot 原位 mask |
 | framesamp-modul_bud64（无 selector） | 27.12 | 64 token = 4 帧 |
 | **dnr_bud64_pool128（三处修复，ckpt 39999，3 seed）** | **28.63 ± 0.25** | **32 token 物理 gather** |
-
-+8.4 远超噪声；相对 framesamp 的 +1.5 在噪声内（单 seed 均值标准误约 1.5），但 policy 只消费一半的 token。匹配 actor 开销的对照应是 framesamp_bud32（2 帧），未跑。
 
 逐任务（ckpt 39999，每任务 50 集；单任务噪声约 ±7，只看大的模式）：
 
@@ -81,17 +78,11 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 | | RouteStick | 18 | 16 | 16 | 16.7 |
 | | **Overall** | **28.375** | **28.625** | **28.875** | **28.625** |
 
-读法：
-- SwingXtimes 84、MoveCube 61、PickXtimes 57 是最好的三项，恰好是置换实验里对 slot 最敏感的三个任务（96→16、92→34、84→46）。选择式记忆在物理 gather 后仍能做好它们，说明时间编位 RoPE 把时钟还给了 selector。
-- PatternLock 10、RouteStick 17、StopCube 24：32 个 token 装不下一条轨迹或精确计时，是 K 太小；InsertPeg 2 是操作精度，所有方法都在 2 到 8。
-- Permanence 一组中等（VideoUnmask 31、ButtonUnmask 18），是否留住了 frame 0 看 W&B 的 `first_frame_keep_frac`。
-- 三处一起上的，8.4 点归不到具体某一项，见下面的消融。
-
 ## 消融配置（每组只还原一项，其余保持完整版）
 
 | 配置 | 还原的项 | 具体设置 |
 |---|---|---|
-| `perceptual-dnr-modul_bud64_pool128_abl1_bernoulli.yaml` | Gumbel-Top-K | root 用逐 token 伯努利，恢复 ratio 1e-3 / z 1e-4 / lb 0.1，原位 mask；内部节点仍 e2e + top-k |
+| `perceptual-dnr-modul_bud64_pool128_abl1_bernoulli.yaml` | Gumbel-Top-K （**感觉没太有必要做**） | root 用逐 token 伯努利，恢复 ratio 1e-3 / z 1e-4 / lb 0.1，原位 mask；内部节点仍 e2e + top-k |
 | `perceptual-dnr-modul_bud64_pool128_abl2_noe2e.yaml` | 端到端树 | 内部节点回到 stop_gradient，只有 root 训 selector |
 | `perceptual-dnr-modul_bud64_pool128_abl3_slotrope.yaml` | 时间 RoPE | 回到 slot 编位，原位 mask |
 
@@ -107,8 +98,5 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 
 ## 未做与待办
 
-- frame-0 锚点未实现。先看 `first_frame_keep_frac`，低于 0.5 再加
-- `noise_scale` 待扫（1.0 对 0.5）：margin 归一到单位方差后 Gumbel 噪声标准差 1.28 偏大
-- 匹配 actor 开销的对照 framesamp_bud32 未跑，这是"同预算下选择赢过均匀"的关键对照
-- 在 dnr checkpoint 上做 selector 之后的置换实验，验证时间编位下成绩不掉
-- 本地评测环境 PatternLock / RouteStick 接近 0（论文 54 / 67），本地数字不要和论文比这两项
+- frame-0 锚点？
+- 消融
