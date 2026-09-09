@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 import jax
 import jax.numpy as jnp
@@ -504,6 +505,14 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
 
 
 if __name__ == "__main__":
-    main(_config.cli(), tentative_run=True)
-    time.sleep(20)
-    main(_config.cli())
+    # The tentative pass warms the machine up for ~10 steps, but it also calls
+    # initialize_checkpoint_dir, so on a FRESH experiment the formal pass that
+    # follows finds the directory already there and dies with FileExistsError.
+    # Set DNR_SKIP_TENTATIVE=1 to run the formal pass only (needed on any host
+    # that does not require the warm-up, and mandatory when resuming).
+    if os.environ.get("DNR_SKIP_TENTATIVE", "0") not in ("", "0"):
+        main(_config.cli())
+    else:
+        main(_config.cli(), tentative_run=True)
+        time.sleep(20)
+        main(_config.cli())
