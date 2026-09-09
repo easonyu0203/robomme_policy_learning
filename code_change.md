@@ -121,54 +121,75 @@ dL/dlogit_keep_i = +dL/ds_i · (z-score 雅可比)，dL/dlogit_drop_i = −同�
 
 被丢掉的 token 的直接 dL/dw 为零，它们的信号来自 z-score 把同节点 margin 耦合起来，以及每轮独立的 Gumbel 噪声让边界 token 偶尔被选中。
 
-## 结果（bud64 / pool128，40k 步，同一评测协议）
+## 结果（bud64 / pool128，ckpt 39999，每任务 150 集 = 50 集 × 3 seed）
 
-| 配置 | 均值 | actor 看到的记忆 |
-|---|---|---|
-| hiersel_pool128_multilevel_emareducer（旧） | 20.25 | 64 slot 原位 mask |
-| framesamp-modul_bud64（无 selector） | 27.12 | 64 token = 4 帧 |
-| **dnr_bud64_pool128（ckpt 39999，3 seed）** | **28.63 ± 0.25** | **32 token** |
+| 配置 | 均值 |
+|---|---|
+| hiersel_pool128_multilevel_emareducer（旧） | 20.25 |
+| framesamp-modul_bud64（无 selector） | 27.12 |
+| e2e 树 + 伯努利 root（`abl_only_tree`） | 28.33 |
+| e2e 树 + Gumbel-Top-K + 时间 RoPE（原 full DNR，已删除） | 28.63 |
+| **e2e 树 + Gumbel-Top-K（`abl3_slotrope` = 现在的主配置）** | **30.04** |
 
-逐任务（ckpt 39999，每任务 50 集；单任务噪声约 ±7，只看大的模式）：
+逐任务（单任务噪声约 ±7，只看大的模式）：
 
-| 任务组 | 任务 | seed 0 | seed 7 | seed 42 | 均值 |
-|---|---|---|---|---|---|
-| Counting | BinFill | 36 | 28 | 26 | 30.0 |
-| | StopCube | 20 | 22 | 30 | 24.0 |
-| | PickXtimes | 62 | 60 | 50 | 57.3 |
-| | SwingXtimes | 72 | 92 | 88 | 84.0 |
-| Permanence | ButtonUnmask | 10 | 16 | 28 | 18.0 |
-| | VideoUnmask | 28 | 38 | 28 | 31.3 |
-| | VideoUnmaskSwap | 20 | 18 | 22 | 20.0 |
-| | ButtonUnmaskSwap | 10 | 16 | 18 | 14.7 |
-| Reference | PickHighlight | 20 | 10 | 18 | 16.0 |
-| | VideoRepick | 20 | 18 | 8 | 15.3 |
-| | VideoPlaceButton | 38 | 34 | 26 | 32.7 |
-| | VideoPlaceOrder | 22 | 24 | 28 | 24.7 |
-| Imitation | MoveCube | 70 | 54 | 60 | 61.3 |
-| | InsertPeg | 2 | 0 | 4 | 2.0 |
-| | PatternLock | 6 | 12 | 12 | 10.0 |
-| | RouteStick | 18 | 16 | 16 | 16.7 |
-| | **Overall** | **28.375** | **28.625** | **28.875** | **28.625** |
+| 任务组 | 任务 | full DNR | 主配置 | only_tree | 主配置 − full | only_tree − 主配置 |
+|---|---|---|---|---|---|---|
+| Counting | BinFill | 30.0 | **40.7** | 32.7 | +10.7 | −8.0 |
+| | StopCube | **24.0** | 11.3 | 9.3 | −12.7 | −2.0 |
+| | PickXtimes | 57.3 | **64.7** | 62.0 | +7.3 | −2.7 |
+| | SwingXtimes | 84.0 | 86.0 | **89.3** | +2.0 | +3.3 |
+| Permanence | ButtonUnmask | **18.0** | 13.3 | 8.0 | −4.7 | −5.3 |
+| | VideoUnmask | **31.3** | 30.7 | 28.0 | −0.7 | −2.7 |
+| | VideoUnmaskSwap | 20.0 | **20.7** | 15.3 | +0.7 | −5.3 |
+| | ButtonUnmaskSwap | 14.7 | 4.7 | **18.0** | −10.0 | +13.3 |
+| Reference | PickHighlight | 16.0 | **18.0** | 16.7 | +2.0 | −1.3 |
+| | VideoRepick | **15.3** | 12.0 | 14.7 | −3.3 | +2.7 |
+| | VideoPlaceButton | 32.7 | **34.7** | 28.0 | +2.0 | −6.7 |
+| | VideoPlaceOrder | 24.7 | 19.3 | **26.0** | −5.3 | +6.7 |
+| Imitation | MoveCube | 61.3 | **62.0** | 57.3 | +0.7 | −4.7 |
+| | InsertPeg | 2.0 | **4.7** | **4.7** | +2.7 | 0.0 |
+| | PatternLock | 10.0 | **24.0** | 16.7 | +14.0 | −7.3 |
+| | RouteStick | 16.7 | **34.0** | 26.7 | +17.3 | −7.3 |
+| | **Overall** | **28.625** | **30.042** | **28.333** | **+1.417** | **−1.708** |
+
+读数：
+
+- 去掉时间编位 RoPE 涨 1.42 pp。时间 RoPE 这条路（改动 3）已从代码里删除，主配置回到 slot 编位 + 原位 mask。
+- 再把 Gumbel-Top-K 换回伯努利跌 1.71 pp，两处改动的方向都得到确认。
+- Gumbel-Top-K 的收益集中在 BinFill、PatternLock、RouteStick、VideoPlaceButton；ButtonUnmaskSwap 和 VideoPlaceOrder 反而是伯努利更好，量级都在单任务噪声附近。
+- StopCube 是三个配置里唯一大幅退步的任务（24.0 → 11.3），值得单独看。
 
 ## 消融配置（每组只还原一项，其余保持完整版）
 
 | 配置 | 还原的项 | 具体设置 |
 |---|---|---|
-| `perceptual-dnr-modul_bud64_pool128_abl1_bernoulli.yaml` | Gumbel-Top-K （**感觉没太有必要做**） | root 用逐 token 伯努利，恢复 ratio 1e-3 / z 1e-4 / lb 0.1，原位 mask；内部节点仍 e2e + top-k |
+| `perceptual-dnr-modul_bud64_pool128_abl1_bernoulli.yaml` | Gumbel-Top-K | root 用逐 token 伯努利，恢复 ratio 1e-3 / z 1e-4 / lb 0.1；内部节点仍 e2e + top-k |
 | `perceptual-dnr-modul_bud64_pool128_abl2_noe2e.yaml` | 端到端树 | 内部节点回到 stop_gradient，只有 root 训 selector |
 
 为支持 abl1，`652e88b` 把 root 的采样方式和内部节点解耦：内部节点固定 e2e + gumbel_topk（物理缩小需要恰好 K），root 可独立选 topk / bernoulli。
+
+## 叠加：随机内部节点路由（`aux_node_prob`）
+
+- 配置：`perceptual-dnr-modul_bud64_pool128_auxnode02.yaml`，即主配置加一行 `selector.aux_node_prob: 0.2`
+- 代码：`percep_mem.py` 的 `_pick_node_input`、`_hierarchical_reduce(collect=...)`、`__call__` 的路由分支
+- 动机：e2e 树里内部节点丢掉的 token 直接离开计算图，唯一的梯度来源是 Gumbel 噪声偶尔把它捞回来，离边界远就基本拿不到。而 root 的 keep-weight 是乘在 MemoryAttention 的 `exp(score)` 上再归一化的，被丢的 token 满足 `∂p/∂g_i ≠ 0`，拿得到"把它放进记忆动作会不会变好"的反事实梯度
+- 做法：训练时每个样本以 0.2 的概率把 root 那一刀改喂给一个均匀随机的内部节点输入（`reduce_chunk_size` 宽的连续块），另外 0.8 走正常的树。评测完全不受影响
+- 开销：零。归约树本来就对整个 batch 跑完，被路由的样本只是用 `where` 丢弃它的输出；内部节点输入是已有张量的切片。相比"再过一遍 policy 算辅助损失"的做法，后者要 2 倍前向，而且辅助损失同样会把 policy 训练在窄记忆上，并不能避免分布偏移
+- 边界情况：整块都是 padding 的节点（短 episode + 右填充）会回落到 root，保证记忆里至少有一个有效 slot
+- 新增 stat：`aux_node_frac`，实际被路由的样本比例，应当稳定在 0.2 附近
+- 与 `multilevel` 的区别：multilevel 是 100% 概率、且内部节点全程 `stop_gradient`，policy 大部分步数训练在窄记忆上；这里是 20% 概率叠加在完整的 e2e 树之上
 
 
 ## 其他文件
 
 - `scripts/launch_dnr_devbox.sh`：4×A800 启动脚本，自动识别 bin/npy、缺 norm_stats 时从 a2r 仓库复制、预检 GPU 与重复启动
 - `examples/robomme/subgoal_predictor.py`：Gemini / Qwen SDK 改惰性导入（感知记忆评测不需要）
-- `tests/test_dnr_fixes.py`：4 项检查（gumbel_topk、e2e 梯度、完整前向、消融配置），`JAX_PLATFORMS=cpu` 两分钟跑完；旧套件 `tests/test_hierarchical_reduction.py` 19/19 通过
-- 新增 stats：`keep_frac`（topk 下恒为 0.5）、`reduce_keep_frac`
+- `tests/test_dnr_fixes.py`：5 项检查（gumbel_topk、e2e 梯度、完整前向、内部节点路由、全部 pool128 配置），`JAX_PLATFORMS=cpu` 两分钟跑完；旧套件 `tests/test_hierarchical_reduction.py` 19/19 通过
+- 新增 stats：`keep_frac`（topk 下恒为 0.5）、`reduce_keep_frac`、`aux_node_frac`
 
 ## 未做与待办
 
 - frame-0 锚点？
-- 消融
+- `aux_node_prob: 0.2` 的 40k 训练与评测
+- StopCube 从 24.0 掉到 11.3 的原因

@@ -2,6 +2,7 @@
   * selector.gumbel_topk        -- exactly-K straight-through mask, train/eval same rule
   * PerceptualMemory e2e_tree   -- gradient reaches internal nodes; eval == legacy rounds
   * full forward (topk root, in-place mask over the budget-length sequence)
+  * aux_node_prob        -- routing a fraction of samples to an internal node
   * ablation configs build and run
 
     JAX_PLATFORMS=cpu PYTHONPATH=src:packages/openpi-client/src python tests/test_dnr_fixes.py
@@ -146,10 +147,60 @@ def test_full_call_topk_root():
     print(f"OK full_call_topk_root (selector grad {n:.3g})")
 
 
+def test_aux_node_routing():
+    """aux_node_prob: a fraction of samples get the root cut applied to a random
+    internal node's input; eval is untouched; gradient still reaches the selector."""
+    model, cfg = build(**{"perceptual_memory.selector.aux_node_prob": 1.0})
+    assert model.aux_node_prob == 1.0 and model.n_nodes == 3
+    img, pos, state, time, mask = rand_inputs(cfg, seed=11)
+    hid = model.feature_encoder.encode_perceptual_memory(img, pos, state, time)
+
+    # with prob 1 every sample is routed: the root cut's input must be one of the
+    # two contiguous 64-wide halves of the 128-token pool, not the tree's output
+    tok, w, stats, = model(img, pos, state, time, mask, train=True, rng=jax.random.key(1))
+    assert tok.shape == (2, cfg.budget, cfg.memory_token_dim)
+    assert float(stats["aux_node_frac"]) == 1.0
+    halves = [np.asarray(hid[:, :cfg.budget]), np.asarray(hid[:, cfg.budget:])]
+    for b in range(2):
+        assert any(np.allclose(np.asarray(tok[b]), h[b], atol=1e-5) for h in halves), \
+            "routed sample did not receive an internal node's input"
+    assert (np.asarray(w.sum(1)) == model.num_keep).all()
+
+    # eval ignores the routing entirely -> identical to the plain e2e config
+    plain, _ = build()
+    t0, w0, _ = plain(img, pos, state, time, mask, train=False, rng=None)
+    t1, w1, _ = model(img, pos, state, time, mask, train=False, rng=None)
+    assert jnp.allclose(t0, t1, atol=1e-5) and jnp.array_equal(w0, w1)
+
+    # an all-padding node must fall back to the root (never an empty memory)
+    m = np.zeros((2, cfg.pool_budget), bool); m[:, :cfg.budget] = True  # 2nd half is padding
+    tok2, w2, stats2 = model(img, pos, state, time, jnp.asarray(m), train=True, rng=jax.random.key(2))
+    assert (np.asarray(w2.sum(1)) > 0).all(), "routed to an all-padding node"
+
+    # p=0.2 lands near 0.2 over a larger batch
+    p02, cfg2 = build(**{"perceptual_memory.selector.aux_node_prob": 0.2})
+    img2, pos2, state2, time2, mask2 = rand_inputs(cfg2, b=256, seed=12)
+    _, _, st = p02(img2, pos2, state2, time2, mask2, train=True, rng=jax.random.key(3))
+    frac = float(st["aux_node_frac"])
+    assert 0.1 < frac < 0.3, frac
+
+    # selector still gets a finite, nonzero gradient on the routed path
+    probe = jax.random.normal(jax.random.key(4), (2, cfg.budget, cfg.memory_token_dim))
+
+    def loss(mo):
+        t, ww, _ = mo(img, pos, state, time, mask, train=True, rng=jax.random.key(1))
+        return jnp.sum(t * probe * ww[..., None])
+
+    g = nnx.grad(loss)(model)
+    n = sum(float(jnp.abs(x).sum()) for x in jax.tree.leaves(g.selector))
+    assert np.isfinite(n) and n > 0, n
+    print(f"OK aux_node_routing (frac at p=0.2: {frac:.3f}, selector grad {n:.3g})")
+
+
 def test_ablation_configs_build_and_run():
-    """The single-fix ablations must construct and run train/eval forwards."""
+    """Every pool128 variant config must construct and run train/eval forwards."""
     import glob, os
-    paths = sorted(glob.glob("src/mme_vla_suite/models/config/robomme/perceptual-dnr-modul_bud64_pool128_abl*.yaml"))
+    paths = sorted(glob.glob("src/mme_vla_suite/models/config/robomme/perceptual-dnr-modul_bud64_pool128_*.yaml"))
     assert paths
     for path in paths:
         cfg = OmegaConf.load(path)
@@ -170,5 +221,6 @@ if __name__ == "__main__":
     test_gumbel_topk()
     test_e2e_rounds_gradient_and_eval_equivalence()
     test_full_call_topk_root()
+    test_aux_node_routing()
     test_ablation_configs_build_and_run()
     print("ALL OK")

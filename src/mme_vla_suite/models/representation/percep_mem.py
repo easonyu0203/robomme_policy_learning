@@ -99,6 +99,7 @@ class PerceptualMemory(nnx.Module):
             # e2e reduction rounds always use gumbel_topk (a physical shrink needs an exact count);
             # the ROOT cut may independently be "topk" or the legacy "bernoulli" (ablation of fix 1).
             self.round_score_norm = selector_cfg.get("round_score_norm", "zscore")
+            self.aux_node_prob = 0.0  # overwritten below for hierarchical configs
 
         if self.is_hierarchical:
             assert self.use_selector, "hierarchical_selection requires perceptual_memory.selector.enabled"
@@ -164,6 +165,40 @@ class PerceptualMemory(nnx.Module):
                     f"reduce_chunk_size ({self.reduce_chunk_size})"
                 )
 
+            # `aux_node_prob`: with this per-sample probability (training only) the
+            # trained root cut is fed a uniformly-random INTERNAL node's input
+            # instead of the tree root's output. Motivation: under e2e_tree a token
+            # an internal node drops leaves the graph, so its only gradient is the
+            # chance that the Gumbel noise keeps it. A routed sample instead applies
+            # the root cut -- whose keep-weight multiplies exp(attention score) and
+            # is renormalised, so a dropped token still has a nonzero d/dg -- to all
+            # `reduce_chunk_size` candidates of that node, giving every one of them a
+            # counterfactual "would the action improve if this token were in memory?"
+            # gradient. The reduction tree still runs for the whole batch and the
+            # routed samples simply discard its output, so no extra transformer
+            # compute is spent (unlike an auxiliary second policy forward, which
+            # would also expose the policy to the narrower memory anyway).
+            self.aux_node_prob = float(selector_cfg.get("aux_node_prob", 0.0))
+            assert 0.0 <= self.aux_node_prob <= 1.0, self.aux_node_prob
+            if self.aux_node_prob > 0:
+                assert self.e2e_tree, "aux_node_prob is an e2e_tree add-on"
+                assert not self.multilevel, "aux_node_prob replaces multilevel routing"
+                assert self.n_nodes - 1 > 0, "no internal nodes to route to (pool_budget == budget)"
+                # Same shape requirements as the multilevel pick: node inputs are
+                # whole `reduce_chunk_size` chunks and must be interchangeable with
+                # the root's input.
+                n = self.input_len
+                for _ in range(self.n_reduce_rounds):
+                    assert n % self.reduce_chunk_size == 0, (
+                        "aux_node_prob needs every round's input length to be a multiple "
+                        f"of reduce_chunk_size ({self.reduce_chunk_size}); got {n}"
+                    )
+                    n = (n // self.reduce_chunk_size) * self.reduce_chunk_keep
+                assert self.reduced_len == self.reduce_chunk_size, (
+                    f"aux_node_prob needs reduced_len ({self.reduced_len}) == "
+                    f"reduce_chunk_size ({self.reduce_chunk_size})"
+                )
+
     def _pick(self, hc, vc, keep, scorer, rng):
         """Score one batch of chunks and pick `keep` per chunk.
 
@@ -223,25 +258,56 @@ class PerceptualMemory(nnx.Module):
         # ==================================================================
         # [改动2] 抽成 _pick：e2e_tree 关 → 执行的就是上面被删的 4 行，weight=None
         #                   e2e_tree 开 → 活 selector + gumbel_topk(rng)，返回 STE 权重
+        # idx：选中了哪些 token。
+        # selected_tokens：这些 token 的内容。
+        # selected_weights：这些 token 对应的 ST 权重。
+        # [..., None]：把 (N, K) 变成 (N, K, 1)，同一个标量权重乘到该 token 的所有特征维度上。
         idx, weight = self._pick(hc, vc, keep, scorer, rng)
-        hc = batch_gather(hc, idx)
+        hc = batch_gather(hc, idx)  # selected_tokens
         if weight is not None:
             # Straight-through scaling: forward x1 (kept tokens have weight exactly
             # 1), backward routes dL/dtoken . token into this node's logits -- the
             # MoE trick (expert output x router prob) applied to a hard top-k.
-            # 前向 ×1（保留 token 的权重恰为 1），反向把 ⟨dL/d(out_i), hc_i⟩ 送进本节点 logits
-            hc = hc * batch_gather(weight, idx)[..., None].astype(hc.dtype)
+            hc = hc * batch_gather(weight, idx)[..., None].astype(hc.dtype) # selected_weights，把 router 的 gate 乘到被选中的输出上
         vc = batch_gather(vc[..., None], idx)[..., 0]
         return hc.reshape(b, n_chunks * keep, dim), vc.reshape(b, n_chunks * keep)
 
-    def _hierarchical_reduce(self, hidden, valid, scorer=None, rng=None):
+    def _hierarchical_reduce(self, hidden, valid, scorer=None, rng=None, collect=None):
         """Repeat `_reduce_one_round` `n_reduce_rounds` times (static, unrolled
         at trace time). Per-round rng is derived by fold_in so every node samples
-        independent Gumbel noise (e2e path only; None -> deterministic)."""
+        independent Gumbel noise (e2e path only; None -> deterministic).
+
+        `collect`: optional list; each round's (input tokens, input valid) is
+        appended to it, which is where `_pick_node_input` reads the internal
+        nodes' inputs from (`aux_node_prob`). Plain Python appends -- the loop is
+        unrolled at trace time."""
         for r in range(self.n_reduce_rounds):
+            if collect is not None:
+                collect.append((hidden, valid))
             rng_r = None if rng is None else jax.random.fold_in(rng, r)
             hidden, valid = self._reduce_one_round(hidden, valid, scorer, rng_r)
         return hidden, valid
+
+    def _pick_node_input(self, node_inputs, picked):
+        """Per sample, gather the `reduce_chunk_size`-wide input of internal node
+        `picked` (round-major numbering, same as `_tree_pick_input`; the root is
+        excluded, so ids run 0..n_nodes-2). Every branch is a slice of a tensor
+        the reduction already produced, so this costs only the `where`s."""
+        chunk = self.reduce_chunk_size
+        h0 = node_inputs[0][0]
+        b, d = h0.shape[0], h0.shape[-1]
+        picked_h = jnp.zeros((b, chunk, d), dtype=h0.dtype)
+        picked_v = jnp.zeros((b, chunk), dtype=jnp.bool_)
+        node = 0
+        for h, v in node_inputs:
+            for k in range(h.shape[1] // chunk):
+                sel = (picked == node)[:, None]
+                sl = slice(k * chunk, (k + 1) * chunk)
+                picked_h = jnp.where(sel[:, :, None], h[:, sl, :], picked_h)
+                picked_v = jnp.where(sel, v[:, sl], picked_v)
+                node += 1
+        assert node == self.n_nodes - 1, (node, self.n_nodes)
+        return picked_h, picked_v
 
     def _tree_pick_input(
         self,
@@ -344,9 +410,28 @@ class PerceptualMemory(nnx.Module):
                 if self.e2e_tree and train:
                     assert rng is not None, "e2e_tree training needs `rng`"
                     rng, rng_tree = jax.random.split(rng)
-                hidden_states, valid_mask = self._hierarchical_reduce(
-                    hidden_states, valid_mask, reducer_selector, rng_tree
+                route_aux = train and self.aux_node_prob > 0
+                node_inputs = [] if route_aux else None
+                reduced_h, reduced_v = self._hierarchical_reduce(
+                    hidden_states, valid_mask, reducer_selector, rng_tree, node_inputs
                 )
+                if route_aux:
+                    assert rng is not None, "aux_node_prob training needs `rng`"
+                    rng, rng_node, rng_use = jax.random.split(rng, 3)
+                    b = reduced_h.shape[0]
+                    picked_node = jax.random.randint(rng_node, (b,), 0, self.n_nodes - 1)
+                    aux_h, aux_v = self._pick_node_input(node_inputs, picked_node)
+                    # An all-padding chunk (short episode, right padding) would leave
+                    # the memory with no valid slot at all, so fall back to the root.
+                    use_aux = jax.random.bernoulli(rng_use, self.aux_node_prob, (b,))
+                    use_aux = use_aux & aux_v.any(axis=-1)
+                    hidden_states = jnp.where(use_aux[:, None, None], aux_h, reduced_h)
+                    valid_mask = jnp.where(use_aux[:, None], aux_v, reduced_v)
+                    extra_stats["aux_node_frac"] = jax.lax.stop_gradient(
+                        use_aux.astype(jnp.float32).mean()
+                    )
+                else:
+                    hidden_states, valid_mask = reduced_h, reduced_v
             real_after = valid_mask.sum(axis=1)
             extra_stats["reduce_keep_frac"] = jax.lax.stop_gradient(
                 jnp.mean(real_after / jnp.clip(real_before, a_min=1.0))
