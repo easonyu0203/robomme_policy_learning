@@ -56,16 +56,6 @@ class PerceptualMemory(nnx.Module):
             else config.budget
         )
 
-        # `mem_rope`: how history_gemma.MemoryAttention positions memory keys.
-        #   "slot" (legacy): RoPE by array slot -> sequence must stay time-ordered
-        #          and full-length (mask in place, no gather).
-        #   "time": RoPE by each token's steps-ago (recovered from the recency
-        #          embedding) -> permutation-invariant, gather-safe.
-        self.mem_rope = config.get("mem_rope", "slot")
-        assert self.mem_rope in ("slot", "time"), self.mem_rope
-        if self.mem_rope == "time":
-            assert config.get("use_time_emb", False), "mem_rope=time needs use_time_emb (steps-ago source)"
-
         selector_cfg = config.perceptual_memory.get("selector", None)
         self.use_selector = selector_cfg is not None and selector_cfg.get("enabled", False)
         if self.use_selector:
@@ -96,8 +86,8 @@ class PerceptualMemory(nnx.Module):
             #   the gathered survivors are scaled by their straight-through mask value
             #   (1 in the forward pass), so the action loss reaches every node of the
             #   tree in one backward pass. Replaces multilevel routing + ema_reducer.
-            # root_gather: physically gather the root's kept tokens (length num_keep)
-            #   instead of masking in place; needs mem_rope=time.
+            # The root cut always masks in place (full `budget`-length sequence, time
+            # order kept): MemoryAttention's RoPE is keyed by array slot (d738e40).
             self.sampling = selector_cfg.get("sampling", "bernoulli")
             assert self.sampling in ("bernoulli", "topk"), self.sampling
             self.tau = float(selector_cfg.get("tau", 1.0))
@@ -106,14 +96,9 @@ class PerceptualMemory(nnx.Module):
                 "score_norm", "zscore" if self.sampling == "topk" else "none"
             )
             self.e2e_tree = bool(selector_cfg.get("e2e_tree", False))
-            self.root_gather = bool(selector_cfg.get("root_gather", False))
             # e2e reduction rounds always use gumbel_topk (a physical shrink needs an exact count);
             # the ROOT cut may independently be "topk" or the legacy "bernoulli" (ablation of fix 1).
             self.round_score_norm = selector_cfg.get("round_score_norm", "zscore")
-            assert not (self.root_gather and self.sampling != "topk"), "root_gather needs selector.sampling=topk"
-            assert not (self.root_gather and self.mem_rope != "time"), (
-                "root_gather needs mem_rope=time: slot-keyed RoPE is not gather-safe (see d738e40)"
-            )
 
         if self.is_hierarchical:
             assert self.use_selector, "hierarchical_selection requires perceptual_memory.selector.enabled"
@@ -189,13 +174,15 @@ class PerceptualMemory(nnx.Module):
         returned straight-through weight is 1 in the forward pass for every kept
         token and carries the gradient to this node's logits.
         """
-        if self.e2e_tree:
-            logits = self.selector(hc, vc)
-            weight, idx = gumbel_topk(
+        if self.e2e_tree:                               # [改动2] 新分支
+            logits = self.selector(hc, vc)              #   活 selector，不 stop_gradient
+            weight, idx = gumbel_topk(                  #   恰好 keep 个，带 STE 权重
                 logits, vc, keep, rng, tau=self.tau, noise_scale=self.noise_scale,
                 score_norm=self.round_score_norm,
             )
             return idx, weight
+        
+        # 原版分枝
         logits = jax.lax.stop_gradient((scorer if scorer is not None else self.selector)(hc, vc))
         idx = select_topk(logits, vc, keep)  # (n, keep) int, margin-sorted
         # Re-sort the survivor indices into ascending position before gathering,
@@ -203,13 +190,12 @@ class PerceptualMemory(nnx.Module):
         # slot-keyed key RoPE in history_gemma.MemoryAttention; see 0464533).
         return jnp.sort(idx, axis=-1), None
 
-    def _reduce_one_round_ext(self, hidden, valid, tpos=None, scorer=None, rng=None):
+    def _reduce_one_round(self, hidden, valid, scorer=None, rng=None):
         """One reduction round (caltech hard_vit.py::_select_chunks): split the
         sequence into contiguous `reduce_chunk_size` chunks (folded into the
         batch dim -> one Selector call), keep the top `reduce_chunk_keep` of each.
 
-        `tpos` (b, l) int32 steps-ago per token travels with the tokens (needed
-        for mem_rope=time); None when unused. `rng` is only used on the e2e path.
+        `rng` is only used on the e2e path (per-node Gumbel noise).
 
         Legacy semantics (e2e_tree off) are unchanged: scoring is stop_gradient
         (preprocessing), the gather stays differentiable wrt `hidden`, and an
@@ -223,45 +209,39 @@ class PerceptualMemory(nnx.Module):
         if pad:
             hidden = jnp.pad(hidden, ((0, 0), (0, pad), (0, 0)))
             valid = jnp.pad(valid, ((0, 0), (0, pad)))
-            if tpos is not None:
-                tpos = jnp.pad(tpos, ((0, 0), (0, pad)))
         dim = hidden.shape[-1]
         hc = hidden.reshape(b * n_chunks, chunk, dim)
         vc = valid.reshape(b * n_chunks, chunk)
+
+        # # 原版：打分 stop_gradient，确定性 top-k，按位置排序，没有权重
+        # logits = jax.lax.stop_gradient(
+        #     (scorer if scorer is not None else self.selector)(hc, vc)
+        # )
+        # idx = select_topk(logits, vc, keep)
+        # idx = jnp.sort(idx, axis=-1)
+        
+        # ==================================================================
+        # [改动2] 抽成 _pick：e2e_tree 关 → 执行的就是上面被删的 4 行，weight=None
+        #                   e2e_tree 开 → 活 selector + gumbel_topk(rng)，返回 STE 权重
         idx, weight = self._pick(hc, vc, keep, scorer, rng)
         hc = batch_gather(hc, idx)
         if weight is not None:
             # Straight-through scaling: forward x1 (kept tokens have weight exactly
             # 1), backward routes dL/dtoken . token into this node's logits -- the
             # MoE trick (expert output x router prob) applied to a hard top-k.
+            # 前向 ×1（保留 token 的权重恰为 1），反向把 ⟨dL/d(out_i), hc_i⟩ 送进本节点 logits
             hc = hc * batch_gather(weight, idx)[..., None].astype(hc.dtype)
         vc = batch_gather(vc[..., None], idx)[..., 0]
-        out_h = hc.reshape(b, n_chunks * keep, dim)
-        out_v = vc.reshape(b, n_chunks * keep)
-        if tpos is None:
-            return out_h, out_v, None
-        tc = tpos.reshape(b * n_chunks, chunk)
-        tc = batch_gather(tc[..., None], idx)[..., 0]
-        return out_h, out_v, tc.reshape(b, n_chunks * keep)
+        return hc.reshape(b, n_chunks * keep, dim), vc.reshape(b, n_chunks * keep)
 
-    def _reduce_one_round(self, hidden, valid, scorer=None):
-        """Legacy 2-tuple wrapper (no time positions, no rng)."""
-        h, v, _ = self._reduce_one_round_ext(hidden, valid, None, scorer, None)
-        return h, v
-
-    def _hierarchical_reduce_ext(self, hidden, valid, tpos=None, scorer=None, rng=None):
-        """Repeat `_reduce_one_round_ext` `n_reduce_rounds` times (static, unrolled
+    def _hierarchical_reduce(self, hidden, valid, scorer=None, rng=None):
+        """Repeat `_reduce_one_round` `n_reduce_rounds` times (static, unrolled
         at trace time). Per-round rng is derived by fold_in so every node samples
-        independent Gumbel noise."""
+        independent Gumbel noise (e2e path only; None -> deterministic)."""
         for r in range(self.n_reduce_rounds):
             rng_r = None if rng is None else jax.random.fold_in(rng, r)
-            hidden, valid, tpos = self._reduce_one_round_ext(hidden, valid, tpos, scorer, rng_r)
-        return hidden, valid, tpos
-
-    def _hierarchical_reduce(self, hidden, valid, scorer=None):
-        """Legacy 2-tuple wrapper: eval path and the non-multilevel legacy train path."""
-        h, v, _ = self._hierarchical_reduce_ext(hidden, valid, None, scorer, None)
-        return h, v
+            hidden, valid = self._reduce_one_round(hidden, valid, scorer, rng_r)
+        return hidden, valid
 
     def _tree_pick_input(
         self,
@@ -317,12 +297,10 @@ class PerceptualMemory(nnx.Module):
         rng: at.KeyArrayLike | None = None,
         reducer_selector: Selector | None = None,
     ):
-        """Returns (tokens, mem_weight, stats, mem_pos).
+        """Returns (tokens, mem_weight, stats).
 
-        tokens (b, S, d); mem_weight (b, S) float keep-weight or None (selector
-        off); stats dict or None; mem_pos (b, S) int32 steps-ago per token when
-        mem_rope=time, else None. S == budget, except with `root_gather`
-        (S == num_keep, kept tokens physically gathered, time order kept).
+        tokens (b, budget, d) in time order; mem_weight (b, budget) float
+        keep-weight (mask in place) or None (selector off); stats dict or None.
         """
         # get memory tokens using feature encoder
         assert static_image_emb.shape[1] == self.input_len
@@ -335,15 +313,8 @@ class PerceptualMemory(nnx.Module):
             static_image_emb, static_pos_emb, static_state_emb, static_time_emb
         )
 
-        tpos = None
-        if self.mem_rope == "time":
-            # The recency feature is log1p(steps-ago) (mem_buffer.py); invert it to
-            # an integer RoPE position. expm1(log1p(x)) round-trips exactly for the
-            # integer step counts we have after rounding.
-            tpos = jnp.round(jnp.expm1(static_time_emb[..., 0].astype(jnp.float32))).astype(jnp.int32)
-
         if not self.use_selector:
-            return hidden_states, None, None, tpos
+            return hidden_states, None, None
 
         valid_mask = (
             static_mask
@@ -355,10 +326,8 @@ class PerceptualMemory(nnx.Module):
         if self.is_hierarchical:
             real_before = valid_mask.sum(axis=1)
             if self.multilevel and train:
-                # Legacy multilevel routing (see _tree_pick_input). Not available
-                # with mem_rope=time (positions would need to travel through the
-                # pick); e2e_tree is the replacement.
-                assert tpos is None, "multilevel is a legacy path; use e2e_tree with mem_rope=time"
+                # Legacy multilevel routing (see _tree_pick_input); e2e_tree is
+                # the replacement.
                 assert rng is not None, "multilevel train pick needs `rng`"
                 rng, rng_pick = jax.random.split(rng)
                 picked_node = jax.random.randint(
@@ -375,8 +344,8 @@ class PerceptualMemory(nnx.Module):
                 if self.e2e_tree and train:
                     assert rng is not None, "e2e_tree training needs `rng`"
                     rng, rng_tree = jax.random.split(rng)
-                hidden_states, valid_mask, tpos = self._hierarchical_reduce_ext(
-                    hidden_states, valid_mask, tpos, reducer_selector, rng_tree
+                hidden_states, valid_mask = self._hierarchical_reduce(
+                    hidden_states, valid_mask, reducer_selector, rng_tree
                 )
             real_after = valid_mask.sum(axis=1)
             extra_stats["reduce_keep_frac"] = jax.lax.stop_gradient(
@@ -388,31 +357,20 @@ class PerceptualMemory(nnx.Module):
             return hidden_states, mem_weight, {
                 "keep_frac": masked_mean(mem_weight, valid_mask),
                 **extra_stats,
-            }, tpos
+            }
 
         logits = self.selector(hidden_states, valid_mask)
 
         if self.sampling == "topk":
             # Exactly-num_keep cut, same rule in train (Gumbel noise) and eval.
-            weight, idx = gumbel_topk(
+            weight, _ = gumbel_topk(
                 logits, valid_mask, self.num_keep, rng if train else None,
                 tau=self.tau, noise_scale=self.noise_scale, score_norm=self.score_norm,
             )
             extra_stats["keep_frac"] = jax.lax.stop_gradient(masked_mean(weight, valid_mask))
-            if tpos is not None:
-                # Diagnostic: keep rate of the oldest frame's tokens (frame 0 of the
-                # pool == the largest steps-ago among valid tokens).
-                oldest = jnp.max(jnp.where(valid_mask, tpos, -1), axis=1, keepdims=True)
-                first = valid_mask & (tpos == oldest)
-                extra_stats["first_frame_keep_frac"] = jax.lax.stop_gradient(
-                    masked_mean(weight, first)
-                )
-            if self.root_gather:
-                tokens = batch_gather(hidden_states, idx)
-                mem_weight = batch_gather(weight[..., None], idx)[..., 0]
-                mem_pos = batch_gather(tpos[..., None], idx)[..., 0]
-                return tokens, mem_weight.astype(hidden_states.dtype), extra_stats, mem_pos
-            return hidden_states, weight.astype(hidden_states.dtype), extra_stats, tpos
+            # Mask in place over the full `budget`-length, time-ordered sequence
+            # (no gather: MemoryAttention's RoPE is slot-keyed; see d738e40).
+            return hidden_states, weight.astype(hidden_states.dtype), extra_stats
 
         # ---- legacy "bernoulli" sampling (unchanged behaviour) ----
         if train:
@@ -420,12 +378,7 @@ class PerceptualMemory(nnx.Module):
             decision = gumbel_softmax_hard(logits, rng)[..., 0]
             mem_weight = decision * valid_mask.astype(hidden_states.dtype)
             losses = selector_losses(logits, decision, valid_mask, self.keep_ratio)
-            if tpos is not None:
-                oldest = jnp.max(jnp.where(valid_mask, tpos, -1), axis=1, keepdims=True)
-                extra_stats["first_frame_keep_frac"] = jax.lax.stop_gradient(
-                    masked_mean(mem_weight, valid_mask & (tpos == oldest))
-                )
-            return hidden_states, mem_weight, {**losses, **extra_stats}, tpos
+            return hidden_states, mem_weight, {**losses, **extra_stats}
 
         # Eval: deterministic top-`num_keep`, hard {0,1} keep-weight over the full
         # `budget`-length sequence (mask in place, no gather -- required by the
@@ -438,4 +391,4 @@ class PerceptualMemory(nnx.Module):
             "keep_frac": masked_mean(mem_weight, valid_mask),
             **extra_stats,
         }
-        return hidden_states, mem_weight, stats, tpos
+        return hidden_states, mem_weight, stats

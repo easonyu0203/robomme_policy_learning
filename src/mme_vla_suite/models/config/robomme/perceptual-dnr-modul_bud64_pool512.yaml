@@ -6,8 +6,7 @@ streaming_obs_horizon: 16
 pool_type: mean
 use_pos_emb: true
 use_state_emb: false
-use_time_emb: true       # recency log1p(steps-ago); also the source of mem_rope=time positions
-mem_rope: time           # MemoryAttention keys RoPE by steps-ago, not array slot (gather-safe)
+use_time_emb: true       # recency log1p(steps-ago)
 memory_feature:
   img:
     net: identity
@@ -41,7 +40,6 @@ perceptual_memory:
     e2e_tree: true           # full-tree backprop; replaces multilevel + ema_reducer
     multilevel: false
     ema_reducer: false
-    root_gather: true        # policy receives the K kept tokens physically (needs mem_rope=time)
     ratio_loss_weight: 0.0
     z_loss_weight: 0.0
     load_balance_loss_weight: 0.0

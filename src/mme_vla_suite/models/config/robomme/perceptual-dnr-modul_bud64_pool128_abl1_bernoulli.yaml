@@ -1,4 +1,4 @@
-# ABLATION: fix 1 reverted -- root cut = legacy per-token Bernoulli + ratio/z/lb losses, in-place mask; e2e rounds + time RoPE kept
+# ABLATION: fix 1 reverted -- root cut = legacy per-token Bernoulli + ratio/z/lb losses, in-place mask; e2e rounds kept
 budget: 64           # root width (2K): tokens the trained cut sees; K = 32 kept
 pool_budget: 128     # 8 even-spaced frames; 1 round (128->64) + root cut (64->32); 3 nodes
 num_views: 1
@@ -7,8 +7,7 @@ streaming_obs_horizon: 16
 pool_type: mean
 use_pos_emb: true
 use_state_emb: false
-use_time_emb: true       # recency log1p(steps-ago); also the source of mem_rope=time positions
-mem_rope: time           # MemoryAttention keys RoPE by steps-ago, not array slot (gather-safe)
+use_time_emb: true       # recency log1p(steps-ago)
 memory_feature:
   img:
     net: identity
@@ -42,7 +41,6 @@ perceptual_memory:
     e2e_tree: true           # full-tree backprop; replaces multilevel + ema_reducer
     multilevel: false
     ema_reducer: false
-    root_gather: false       # Bernoulli count is random -> mask in place (equivalent under time RoPE)
     ratio_loss_weight: 0.001  # old hiersel lineage weights
     z_loss_weight: 1e-4
     load_balance_loss_weight: 0.1

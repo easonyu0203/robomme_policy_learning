@@ -1,6 +1,6 @@
 # D&R 代码改动说明（分支 `dnr-fixes`，基于 `origin/prompt-vla` 7d01bc3）
 
-日期：2026-09-07。主 commit `605963e`，消融配置 `652e88b`。
+日期：2026-09-07。主 commit `605963e`，消融配置 `652e88b`；2026-09-09 移除时间编位 RoPE / root_gather（消融显示无收益），memory 侧接口回到原版 3 元组。
 
 ## 动机：置换实验
 
@@ -29,7 +29,7 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 
 不变的部分：budget 64、pool_budget 128、type hierarchical_selection、pool_sampling even、keep_ratio 0.5、selector depth 2 / 8 heads / 4 register、memory_feature、modulation 集成、use_time_emb true。也就是同一棵 3 节点树（8 帧 128 token，一轮 128→64，root 64→32），同样的 selector 结构。
 
-改动的行（每行对应下面的三处修复）：
+改动的行（每行对应下面的两处修复）：
 
 | 项 | hiersel_emareducer（旧） | dnr（新） | 对应修复 |
 |---|---|---|---|
@@ -37,10 +37,8 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 | `ratio` / `z` / `load_balance` 损失权重 | 1e-3 / 1e-4 / 0.1 | 全 0 | 1 |
 | `multilevel` / `ema_reducer` | true / true | false / false | 2 |
 | `e2e_tree` | 无 | true | 2 端到端树 |
-| `mem_rope`（根级） | 无（默认 slot） | time | 3 时间 RoPE |
-| `root_gather` | 无（默认 false，原位 mask） | true | 3 物理 gather |
 
-## 三处改动
+## 两处改动
 
 ### 1. Gumbel-Top-K 替换逐 token 伯努利
 
@@ -53,17 +51,75 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 ### 2. 整棵树端到端
 
 - 配置：`selector.e2e_tree: true`（默认 false），与 `multilevel`、`ema_reducer` 互斥
-- 代码：`percep_mem.py` 的 `_pick`、`_reduce_one_round_ext`、`_hierarchical_reduce_ext`
+- 代码：`percep_mem.py` 的 `_pick`、`_reduce_one_round`、`_hierarchical_reduce`（多了可选 `rng`）
 - 因为开销基本不变甚至更低（前向不变（旧代码本来每个节点都跑 selector），多出各节点 selector 的反向），而且考虑会更稳定、以及尽量避免distribution shift p(memory|history)（同时也尽量避免 p(action|obs, memory)的distribution shift）, 就换成整棵树了。
 
 
-### 3. 时间编位 RoPE 加物理 gather
+#### 与原版的逐行对照（`_reduce_one_round`，percep_mem.py）
 
-- 配置：`mem_rope: time`（history config 根级，默认 `slot`），`selector.root_gather: true`
-- 代码：`history_gemma.py` MemoryAttention 第 84 到 91 行附近；`mem_pos` 穿过 HistoryBlock 的 remat/scan（`static_argnums` 7→8）和 `history_pi0.py` 全部调用点（`embed_memory` 多返回一个 `mem_pos`）
-- 旧：key 的 RoPE 位置 = `arange(mem_len)`，query 从 S 往后数。相位差 = slot 距离。后果：推理不能物理 gather（commit d738e40），归约后必须按索引重排（commit 0464533），选择后 slot 相位不再表示时间
-- 新：key 位置 = 该 token 的 steps-ago（从 recency 嵌入 `expm1` 反推），query 位置 = 0，相位差 = recency，与 slot 顺序、选择、gather 无关。root 可以把保留的 K 个 token 物理取出，policy 只看 K 个
-- 这个是主要变化，因为原先的position ID只适用于framesamp。
+无标记的行是原版原样保留；`-` 是原版被替换掉的行；`+` 是新增行。
+
+```diff
+-    def _reduce_one_round(self, hidden, valid, scorer=None):
++    def _reduce_one_round(self, hidden, valid, scorer=None, rng=None):
++        # [改动2] rng: 本节点 Gumbel 噪声
+         chunk, keep = self.reduce_chunk_size, self.reduce_chunk_keep
+         b, n = hidden.shape[0], hidden.shape[1]
+         n_chunks = -(-n // chunk)  # ceil
+         pad = n_chunks * chunk - n
+         if pad:
+             hidden = jnp.pad(hidden, ((0, 0), (0, pad), (0, 0)))
+             valid = jnp.pad(valid, ((0, 0), (0, pad)))
+         dim = hidden.shape[-1]
+         hc = hidden.reshape(b * n_chunks, chunk, dim)
+         vc = valid.reshape(b * n_chunks, chunk)
+
+-        # 原版：打分 stop_gradient，确定性 top-k，按位置排序，没有权重
+-        logits = jax.lax.stop_gradient(
+-            (scorer if scorer is not None else self.selector)(hc, vc)
+-        )
+-        idx = select_topk(logits, vc, keep)
+-        idx = jnp.sort(idx, axis=-1)
++        # [改动2] 抽成 _pick：e2e_tree 关 → 执行的就是上面被删的 4 行，weight=None
++        #                    e2e_tree 开 → 活 selector + gumbel_topk(rng)，返回 STE 权重
++        idx, weight = self._pick(hc, vc, keep, scorer, rng)
+
+         hc = batch_gather(hc, idx)
++        if weight is not None:                                # [改动2] 端到端的核心
++            # 前向 ×1（保留 token 的权重恰为 1），反向把 ⟨dL/d(out_i), hc_i⟩ 送进本节点 logits
++            hc = hc * batch_gather(weight, idx)[..., None].astype(hc.dtype)
+         vc = batch_gather(vc[..., None], idx)[..., 0]
+
+         return hc.reshape(b, n_chunks * keep, dim), vc.reshape(b, n_chunks * keep)
++        # rng=None（legacy 或 eval）→ _pick 走原版分支，行为与原版逐 bit 一致
+```
+
+配套新增的 `_pick`：
+
+```diff
++    def _pick(self, hc, vc, keep, scorer, rng):
++        if self.e2e_tree:                                     # [改动2] 新分支
++            logits = self.selector(hc, vc)                    #   活 selector，不 stop_gradient
++            weight, idx = gumbel_topk(logits, vc, keep, rng,  #   恰好 keep 个，带 STE 权重
++                                      tau=self.tau, noise_scale=self.noise_scale,
++                                      score_norm=self.round_score_norm)
++            return idx, weight
++        # legacy 分支 = 原版被删的 4 行原样搬过来
++        logits = jax.lax.stop_gradient((scorer if scorer is not None else self.selector)(hc, vc))
++        idx = select_topk(logits, vc, keep)
++        return jnp.sort(idx, axis=-1), None
+```
+
+梯度链（`gumbel_topk` 定义，改动 1；内部节点复用，改动 2）：
+
+```
+dL/dw_i  = ⟨dL/d(out_i), hc_i⟩          乘法的导数：输出梯度与 token 内容的内积
+dL/ds_i  = dL/dw_i · y_i(1−y_i)/τ       sigmoid 松弛的导数，thr 取第 K 名与第 K+1 名中点
+dL/dlogit_keep_i = +dL/ds_i · (z-score 雅可比)，dL/dlogit_drop_i = −同值
+→ selector 的 head / blocks / register tokens（三个节点共享，梯度相加）
+```
+
+被丢掉的 token 的直接 dL/dw 为零，它们的信号来自 z-score 把同节点 margin 耦合起来，以及每轮独立的 Gumbel 噪声让边界 token 偶尔被选中。
 
 ## 结果（bud64 / pool128，40k 步，同一评测协议）
 
@@ -71,7 +127,7 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 |---|---|---|
 | hiersel_pool128_multilevel_emareducer（旧） | 20.25 | 64 slot 原位 mask |
 | framesamp-modul_bud64（无 selector） | 27.12 | 64 token = 4 帧 |
-| **dnr_bud64_pool128（三处修复，ckpt 39999，3 seed）** | **28.63 ± 0.25** | **32 token 物理 gather** |
+| **dnr_bud64_pool128（ckpt 39999，3 seed）** | **28.63 ± 0.25** | **32 token** |
 
 逐任务（ckpt 39999，每任务 50 集；单任务噪声约 ±7，只看大的模式）：
 
@@ -101,17 +157,16 @@ Critically, Fig 2(b): "**even without losing any visual tokens**, the presence o
 |---|---|---|
 | `perceptual-dnr-modul_bud64_pool128_abl1_bernoulli.yaml` | Gumbel-Top-K （**感觉没太有必要做**） | root 用逐 token 伯努利，恢复 ratio 1e-3 / z 1e-4 / lb 0.1，原位 mask；内部节点仍 e2e + top-k |
 | `perceptual-dnr-modul_bud64_pool128_abl2_noe2e.yaml` | 端到端树 | 内部节点回到 stop_gradient，只有 root 训 selector |
-| `perceptual-dnr-modul_bud64_pool128_abl3_slotrope.yaml` | 时间 RoPE | 回到 slot 编位，原位 mask |
 
-为支持 abl1，`652e88b` 把 root 的采样方式和内部节点解耦：内部节点固定 e2e + gumbel_topk（物理缩小需要恰好 K），root 可独立选 topk / bernoulli。时间编位下原位 mask 与 gather 等价，所以 abl1 是干净的对照。
+为支持 abl1，`652e88b` 把 root 的采样方式和内部节点解耦：内部节点固定 e2e + gumbel_topk（物理缩小需要恰好 K），root 可独立选 topk / bernoulli。
 
 
 ## 其他文件
 
 - `scripts/launch_dnr_devbox.sh`：4×A800 启动脚本，自动识别 bin/npy、缺 norm_stats 时从 a2r 仓库复制、预检 GPU 与重复启动
 - `examples/robomme/subgoal_predictor.py`：Gemini / Qwen SDK 改惰性导入（感知记忆评测不需要）
-- `tests/test_dnr_fixes.py`：6 项检查，`JAX_PLATFORMS=cpu` 两分钟跑完；旧套件 `tests/test_hierarchical_reduction.py` 19/19 通过
-- 新增 stats：`keep_frac`（topk 下恒为 0.5）、`reduce_keep_frac`、`first_frame_keep_frac`（frame 0 的保留率）
+- `tests/test_dnr_fixes.py`：4 项检查（gumbel_topk、e2e 梯度、完整前向、消融配置），`JAX_PLATFORMS=cpu` 两分钟跑完；旧套件 `tests/test_hierarchical_reduction.py` 19/19 通过
+- 新增 stats：`keep_frac`（topk 下恒为 0.5）、`reduce_keep_frac`
 
 ## 未做与待办
 

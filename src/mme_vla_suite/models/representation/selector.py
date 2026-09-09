@@ -88,7 +88,7 @@ def gumbel_topk(
     Returns (weight (B, L) float32, idx (B, num_keep) int32 sorted ascending,
     i.e. in time order for a time-sorted, left-packed sequence).
     """
-    margin = (logits[..., 0] - logits[..., 1]).astype(jnp.float32)
+    margin = (logits[..., 0] - logits[..., 1]).astype(jnp.float32)  # 每个 token 的 selector 输出两个 logits，先计算“保留倾向”：keep_log - drop_log
     if score_norm == "zscore":
         margin = zscore_margin(margin, valid_mask)
     if rng is not None and noise_scale > 0:
