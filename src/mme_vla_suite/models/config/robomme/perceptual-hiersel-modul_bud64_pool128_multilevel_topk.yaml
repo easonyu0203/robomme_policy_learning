@@ -1,0 +1,61 @@
+budget: 64           # post-reduction sequence length (what the backbone pays for)
+pool_budget: 128     # 1 no-grad reduction round (128->64), then the trained
+                     # selector cut (64->32). 3 tree nodes (2 leaf chunks + root).
+                     #
+                     # = perceptual-hiersel-modul_bud64_pool128_multilevel.yaml with the
+                     # final trained cut switched from per-token Bernoulli + ratio/z/
+                     # load-balance losses to Gumbel-top-k (selector.gumbel_topk):
+                     # exactly num_keep kept, same rule in train (Gumbel noise) and
+                     # eval, no auxiliary losses. The multilevel random-node routing
+                     # is UNCHANGED -- the no-grad reduction rounds still build the
+                     # tree and a uniformly-random node's input is still fed to the
+                     # cut every training step. Only the cut's sampling changes.
+                     # Companion of perceptual-dnr-modul_bud64_pool128.yaml (e2e tree)
+                     # and perceptual-hardsel-modul_bud64_pool128_topk.yaml (random pool).
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even  # evenly-spaced frame-rate reduction; deterministic, uniform coverage
+  selector:
+    enabled: true
+    keep_ratio: 0.5 # final trained cut: `budget` -> round(budget * keep_ratio) (64 -> 32)
+    depth: 2
+    num_heads: 8
+    num_register_tokens: 4
+    # Multi-level pick (unchanged from perceptual-hiersel-modul_bud64_pool128_multilevel.yaml):
+    # during training the trained cut is fed a uniformly-random reduction-tree
+    # node's input (n_nodes = 3 for pool128), not always the root's. Eval is
+    # unchanged (always the root). See percep_mem.py::_tree_pick_input.
+    multilevel: true
+    # ---- Gumbel-top-k cut (replaces Bernoulli + ratio/z/load-balance) ----
+    sampling: topk           # Gumbel-top-k: exactly K kept, same rule train/eval; no aux losses
+    score_norm: zscore       # standardize keep-margins within the node (replaces z-loss)
+    tau: 1.0                 # sigmoid width of the straight-through relaxation (z-scored units)
+    noise_scale: 1.0         # Gumbel noise scale in training (0 = deterministic)
+    e2e_tree: false          # reduction rounds stay no-grad; multilevel routing does the depth coverage
+    ema_reducer: false
+    ratio_loss_weight: 0.0
+    z_loss_weight: 0.0
+    load_balance_loss_weight: 0.0

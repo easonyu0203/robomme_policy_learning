@@ -197,6 +197,60 @@ def test_aux_node_routing():
     print(f"OK aux_node_routing (frac at p=0.2: {frac:.3f}, selector grad {n:.3g})")
 
 
+def _rand_inputs_len(cfg, input_len, b=2, n_real=None, seed=0):
+    """rand_inputs, but for a config whose model input length is not cfg.pool_budget
+    (e.g. type: random_sampling, where pool_budget is nested and the model still
+    receives exactly `budget` tokens)."""
+    rng = np.random.default_rng(seed)
+    mk = lambda d: jnp.asarray(rng.standard_normal((b, input_len, d)), dtype=jnp.float32)
+    img, pos, state = (mk(cfg.memory_feature.img.input_dim), mk(cfg.memory_feature.pos.input_dim),
+                       mk(cfg.memory_feature.state.input_dim))
+    frames = input_len // cfg.token_per_image
+    steps_ago = np.repeat(np.linspace(300, 0, frames).round(), cfg.token_per_image)
+    time = jnp.asarray(np.log1p(steps_ago)[None, :, None].repeat(b, 0), dtype=jnp.float32)
+    if n_real is None:
+        mask = jnp.ones((b, input_len), dtype=bool)
+    else:
+        m = np.zeros((b, input_len), dtype=bool); m[:, :min(n_real, input_len)] = True; mask = jnp.asarray(m)
+    return img, pos, state, time, mask
+
+
+def test_topk_over_multilevel_and_random_pool():
+    """`sampling: topk` also drives the trained cut for the two other selector
+    lineages -- multilevel tree-node routing and the even-pool random subset --
+    with no code change: exactly-K {0,1} mask over the budget-length sequence,
+    no aux losses, gradient to the selector and the encoder."""
+    from omegaconf import OmegaConf
+    for name in ("perceptual-hiersel-modul_bud64_pool128_multilevel_topk",
+                 "perceptual-hardsel-modul_bud64_pool128_topk"):
+        cfg = OmegaConf.load(f"src/mme_vla_suite/models/config/robomme/{name}.yaml")
+        model = PerceptualMemory(config=cfg, rngs=nnx.Rngs(0), dtype=jnp.float32)
+        assert model.sampling == "topk" and not model.e2e_tree
+        K = model.num_keep
+        mk_in = lambda n_real, seed: _rand_inputs_len(cfg, model.input_len, n_real=n_real, seed=seed)
+        for n_real in (100, None):
+            img, pos, state, time, mask = mk_in(n_real, 1)
+            for train in (True, False):
+                tok, w, stats = model(img, pos, state, time, mask, train=train, rng=jax.random.key(2))
+                assert tok.shape == (2, cfg.budget, cfg.memory_token_dim), tok.shape
+                assert set(np.unique(np.asarray(w)).tolist()) <= {0.0, 1.0}
+                assert (np.asarray(w.sum(1)) == K).all(), w.sum(1)
+                assert not any(k in stats for k in ("ratio_loss", "z_loss", "load_balance_loss"))
+                assert "keep_frac" in stats
+        img, pos, state, time, mask = mk_in(100, 1)
+        probe = jax.random.normal(jax.random.key(9), (2, cfg.budget, cfg.memory_token_dim))
+
+        def loss(m):
+            tok, w, _ = m(img, pos, state, time, mask, train=True, rng=jax.random.key(2))
+            return jnp.sum(tok * probe * w[..., None])
+
+        g = nnx.grad(loss)(model)
+        gsel = sum(float(jnp.abs(x).sum()) for x in jax.tree.leaves(g.selector))
+        genc = sum(float(jnp.abs(x).sum()) for x in jax.tree.leaves(g.feature_encoder))
+        assert np.isfinite(gsel) and gsel > 0 and np.isfinite(genc) and genc > 0, (gsel, genc)
+        print(f"OK topk cut over {name}  (multilevel={getattr(model, 'multilevel', False)}, sel_grad={gsel:.3g})")
+
+
 def test_ablation_configs_build_and_run():
     """Every pool128 variant config must construct and run train/eval forwards."""
     import glob, os
@@ -222,5 +276,6 @@ if __name__ == "__main__":
     test_e2e_rounds_gradient_and_eval_equivalence()
     test_full_call_topk_root()
     test_aux_node_routing()
+    test_topk_over_multilevel_and_random_pool()
     test_ablation_configs_build_and_run()
     print("ALL OK")
