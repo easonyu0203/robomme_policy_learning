@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import os
 import time
 from typing import Any, TypeAlias
 
@@ -105,6 +106,7 @@ class MME_VLA_Policy:
         self._prepare_mem_buffer()
         self.step_idx = -1  
         self.exec_start_idx = 0
+        self._dump_ep = getattr(self, "_dump_ep", -1) + 1
         self._rng = jax.random.key(self._seed)
             
     
@@ -172,6 +174,41 @@ class MME_VLA_Policy:
                     prepare(self.step_idx, self.config.pool_budget, token_per_image, history_feats_gather_fn)
             else:
                 raise ValueError(f"Unknown perceptual_memory.type: {self.config.perceptual_memory.type}")
+
+            # Visualization hook: with DNR_DUMP_DIR set, save the memory pool this
+            # step was built from (frame indices, raw pixels and the encoder inputs)
+            # so the selector tree can be replayed offline. No effect when unset.
+            dump_dir = os.environ.get("DNR_DUMP_DIR")
+            if dump_dir and self.config.perceptual_memory.type == "hierarchical_selection":
+                # one subdirectory per episode, in the order the client runs them
+                dump_dir = os.path.join(dump_dir, f"ep{getattr(self, '_dump_ep', 0):03d}")
+                os.makedirs(dump_dir, exist_ok=True)
+                pool_idx = self.mem_buffer.get_frame_sampling_indices(
+                    self.step_idx, self.config.pool_budget, token_per_image
+                )
+                # also mirror the raw frame history incrementally, so any other
+                # memory mechanism (frame sampling, token dropping) can be replayed
+                # offline over exactly this rollout.
+                hist_dir = os.path.join(dump_dir, "history")
+                os.makedirs(hist_dir, exist_ok=True)
+                for i, feats in self.mem_buffer._history_feats.items():
+                    fp = os.path.join(hist_dir, f"frame_{i:05d}.npy")
+                    if not os.path.exists(fp):
+                        np.save(fp, feats["image_pixels"])
+                np.savez_compressed(
+                    os.path.join(dump_dir, f"pool_step{self.step_idx:05d}.npz"),
+                    step_idx=self.step_idx,
+                    exec_start_idx=self.exec_start_idx,
+                    pool_indices=np.asarray(pool_idx),
+                    frames=np.stack(
+                        [self.mem_buffer._history_feats[i]["image_pixels"] for i in pool_idx]
+                    ),
+                    static_image_emb=np.asarray(static_image_emb, dtype=np.float32),
+                    static_pos_emb=np.asarray(static_pos_emb),
+                    static_state_emb=np.asarray(self._normalize_state(static_state_emb)),
+                    static_time_emb=np.asarray(static_time_emb),
+                    static_mask=np.asarray(static_mask),
+                )
 
             inputs["static_image_emb"] = static_image_emb
             inputs["static_pos_emb"] = static_pos_emb

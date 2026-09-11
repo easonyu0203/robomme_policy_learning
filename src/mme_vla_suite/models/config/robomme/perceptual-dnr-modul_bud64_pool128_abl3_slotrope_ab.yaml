@@ -1,0 +1,50 @@
+# A+B improvement on the 40k SOTA abl3_slotrope baseline.
+# Keep slot-keyed RoPE and the in-place root mask; add path-carried ST gates.
+budget: 64
+pool_budget: 128
+num_views: 1
+token_per_image: 16
+streaming_obs_horizon: 16
+pool_type: mean
+use_pos_emb: true
+use_state_emb: false
+use_time_emb: true       # retain scalar recency features; this is not time-keyed RoPE
+mem_rope: slot           # retain the SOTA abl3 slot-keyed RoPE
+memory_feature:
+  img:
+    net: identity
+    input_dim: 2048
+  pos:
+    input_dim: 768
+    hidden_dim: 768
+  state:
+    input_dim: 8
+    hidden_dim: 512
+  time:
+    input_dim: 1
+    hidden_dim: 64
+integration_type: modulation
+memory_token_dim: 1024
+representation_type: perceptual
+perceptual_memory:
+  type: hierarchical_selection
+  pool_sampling: even
+  selector:
+    enabled: true
+    keep_ratio: 0.5
+    depth: 2
+    num_heads: 8
+    num_register_tokens: 4
+    sampling: topk
+    score_norm: zscore
+    tau: 1.0
+    noise_scale: 1.0
+    e2e_tree: true
+    tree_weight_mode: path  # carry internal ST gates to attention, bypassing token RMSNorm
+    multilevel: false
+    ema_reducer: false
+    root_gather: false       # slot RoPE is not gather-safe; retain all 64 root candidates
+    root_gather_train: false # explicit training policy; root_gather=false also keeps eval in-place
+    ratio_loss_weight: 0.0
+    z_loss_weight: 0.0
+    load_balance_loss_weight: 0.0
