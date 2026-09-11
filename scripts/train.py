@@ -494,9 +494,10 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             print("\n\n\n==========Tentative run completed==========\n\n\n")
             break
 
-        if (
-            step % config.save_interval == 0 and step > start_step
-        ) or step == config.num_train_steps - 1:
+        if not tentative_run and (
+            (step % config.save_interval == 0 and step > start_step)
+            or step == config.num_train_steps - 1
+        ):
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
