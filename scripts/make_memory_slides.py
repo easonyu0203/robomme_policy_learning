@@ -150,6 +150,84 @@ def mode_tasks(args):
     print("wrote", args.out, len(prs.slides._sldIdLst), "slides")
 
 
+def _strip(sl, y, cells, x0, cell, gapx, label, sub, exec_start, labcol=INK):
+    """One mechanism's frame row; every frame is placed as its own picture."""
+    tb(sl, 0.16, y + cell / 2 - 0.34, 1.10, 0.8, label, 11, labcol, True, PP_ALIGN.RIGHT)
+    tb(sl, 0.16, y + cell / 2 + 0.06, 1.10, 0.5, sub, 8.5, GREY, False, PP_ALIGN.RIGHT)
+    for i, c in enumerate(cells):
+        x = x0 + i * (cell + gapx)
+        col = DEMO if c["t"] < exec_start else EXEC
+        pic = sl.shapes.add_picture(c["path"], Inches(x), Inches(y), Inches(cell), Inches(cell))
+        pic.line.color.rgb = col
+        pic.line.width = Pt(1.6)
+        tb(sl, x, y - 0.22, cell, 0.2, f"t = {c['t']}", 9.5, col, True, PP_ALIGN.CENTER)
+        tb(sl, x, y + cell + 0.02, cell, 0.2, c["cap"], 9, col, False, PP_ALIGN.CENTER)
+
+
+def mode_mechanisms(args):
+    """One slide per task: FrameSamp, D&R and TokenDrop on the same rollout."""
+    prs = new_deck()
+    picks = json.load(open(args.picks))
+    BLUE = RGBColor(0x05, 0xB9, 0xE2)
+    sl = prs.slides.add_slide(prs.slide_layouts[6])
+    tb(sl, 0.7, 0.75, 12, 0.8, "Three memory mechanisms, every RoboMME task", 30, INK, True)
+    tb(sl, 0.7, 1.7, 12, 0.4, args.subtitle, 15, GREY)
+    tb(sl, 0.7, 2.5, 12, 3.8,
+       "FrameSamp and TokenDrop pick their tokens with parameter-free rules that live in the memory buffer, so "
+       "given the same\nframes they build the same memory whichever policy produced them. Each slide replays all "
+       "three over one rollout.\n\n"
+       "FrameSamp (budget 64)   4 evenly spaced frames, all 16 patches of each kept. Sparse in time, complete per frame.\n\n"
+       "D&R (budget 64, pool 128)   8 evenly spaced frames, 128 candidates cut to 32 by the tree. Twice the time "
+       "coverage,\nonly a few patches per frame. Shown at deployment settings (deterministic top-K).\n\n"
+       "TokenDrop (budget 512)   8×8 patches scored by pixel difference every 8 frames; the highest scoring fill the "
+       "budget.\nFrame 0 enters with a sentinel score of 1000 and can never be evicted. The 8 frames shown are those "
+       "holding the\nmost tokens, out of the many the mechanism draws from.\n\n"
+       "Black mask = not in memory.   Purple border = demonstration video · green = the robot's own rollout.", 14)
+    X0, CELL, GAPX = 1.32, 1.30, 0.055
+    for task in sorted(picks):
+        fs = os.path.join(args.baselines, task)
+        dn = os.path.join(args.dnr, task)
+        fsm = sorted(glob.glob(os.path.join(fs, "manifest_framesamp*_step*.json")))
+        tdm = sorted(glob.glob(os.path.join(fs, "manifest_tokendrop512_step*.json")))
+        dnm = sorted(glob.glob(os.path.join(dn, "manifest_step*.json")))
+        if not (fsm and tdm and dnm):
+            print("skipping", task, "- missing manifests")
+            continue
+        fsj, tdj, dnj = (json.load(open(m[-1])) for m in (fsm, tdm, dnm))
+        v = picks[task]
+        ex = dnj["exec_start"]
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        tb(sl, 0.5, 0.22, 9, 0.45, task, 23, INK, True)
+        tb(sl, 0.5, 0.70, 12.4, 0.26,
+           f"episode {v['chosen_episode']} · {'success' if v['success'] else 'FAILED rollout'} · "
+           f"control step {dnj['step']} · "
+           + (f"execution starts at t={ex}" if ex else "no demonstration video in this task"),
+           11.5, GREY)
+        _strip(sl, 1.30,
+               [{"t": f["t"], "path": os.path.join(fs, f["file"]), "cap": f"{f['kept']}/16"}
+                for f in fsj["frames"]],
+               X0, CELL, GAPX, "FrameSamp", "budget 64\n4 frames × 16", ex)
+        _strip(sl, 3.20,
+               [{"t": dnj["frames"][i]["t"], "path": os.path.join(dn, c["file"]), "cap": f"{c['kept']}/16"}
+                for i, c in enumerate(dnj["rows"][0]["cells"])],
+               X0, CELL, GAPX, "D&R", "budget 64\npool 128 → 32", ex, ACC)
+        _strip(sl, 5.10,
+               [{"t": f["t"], "path": os.path.join(fs, f["file"]), "cap": f"{f['kept']}/64"}
+                for f in tdj["frames"]],
+               X0, CELL, GAPX, "TokenDrop",
+               f"budget 512\ntop 8 of {tdj['n_source_frames']} frames", ex, BLUE)
+        kept_demo = sum(c["kept"] for c, fr in zip(dnj["rows"][0]["cells"], dnj["frames"])
+                        if fr["t"] < ex)
+        tb(sl, 0.5, 6.74, 12.4, 0.5,
+           f"FrameSamp spends its 64 tokens on 4 whole frames.   "
+           f"D&R spreads the same budget over 8 frames"
+           + (f" and keeps {kept_demo} of 32 from the video.   " if ex else ".   ")
+           + f"TokenDrop draws from {tdj['n_source_frames']} frames, 64 of its slots being frame 0's sentinel.",
+           11, GREY, False, PP_ALIGN.CENTER)
+    prs.save(args.out)
+    print("wrote", args.out, len(prs.slides._sldIdLst), "slides")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
@@ -160,6 +238,12 @@ def main():
     b.add_argument("--picks", required=True); b.add_argument("--out", required=True)
     b.add_argument("--subtitle", default="dnr_bud64_pool128_abl3_slotrope_ab @ 80k · seed 7")
     b.set_defaults(fn=mode_tasks)
+    c = sub.add_parser("mechanisms")
+    c.add_argument("--dnr", required=True, help="root of per-task D&R frame exports")
+    c.add_argument("--baselines", required=True, help="root of per-task FrameSamp/TokenDrop exports")
+    c.add_argument("--picks", required=True); c.add_argument("--out", required=True)
+    c.add_argument("--subtitle", default="dnr_bud64_pool128_abl3_slotrope_ab @ 80k · seed 7")
+    c.set_defaults(fn=mode_mechanisms)
     args = ap.parse_args()
     args.fn(args)
 
